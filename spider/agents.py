@@ -54,7 +54,6 @@ class Agent:
         # "waiting_validation" until its parent accepts it (then _validated=True, status done).
         self._validated = parent is None  # the root (orchestrator) needs no validation
         self._finish_nudges = 0           # times we've nudged this agent to call finish
-        self._exhausted = False           # already did the turn-budget handoff (don't repeat it)
         self._stop = asyncio.Event()
         self.inbox: "asyncio.Queue[str]" = asyncio.Queue()
         self.is_running = False
@@ -147,15 +146,26 @@ class Agent:
         self._emit_message("user", self.task)
         return await self._loop()
 
+    def _max_turns(self) -> int:
+        """The turn budget for this agent's role, read LIVE from the session's CURRENT config
+        rather than the snapshot taken when the agent was created. This means raising `max_turns`
+        in Settings takes effect on the next run/continue, instead of being frozen at the value
+        that was configured when the session (or agent) was first created. Falls back to the
+        creation snapshot, then 40."""
+        role_cfg = (self.session.cfg.get("models", {}) or {}).get(self.role) or {}
+        return int(role_cfg.get("max_turns") or self.model_config.get("max_turns", 40))
+
     async def run_followup(self) -> str:
-        # Re-activate an idle / finished / STOPPED agent (operator re-engagement, a parent
-        # send-back, or an ask_parent/message reply). Clear the stop flag — otherwise a
+        # Re-activate an idle / finished / exhausted / STOPPED agent (operator re-engagement, a
+        # parent send-back, or an ask_parent/message reply). Clear the stop flag — otherwise a
         # previously-stopped agent's loop would break out immediately on the `if self.stopped`
-        # check and the operator could never resume a conversation with it. The TURN BUDGET
-        # (`self._turns`) is deliberately PRESERVED across stop/re-activation: it is a per-session
-        # limit, so stopping then resuming an agent must NOT hand it a fresh budget. Only the
-        # finish-nudge counter is reset, so the new exchange gets its own "are you done?" cycle.
-        # New inbox message(s) are drained at the top of the loop.
+        # check and the operator could never resume a conversation with it. New inbox message(s)
+        # are drained at the top of the loop.
+        #
+        # The turn budget (self._turns) is PRESERVED across every re-activation: it is a per-session
+        # limit, and re-engaging (stop/resume, send-back, or an operator "continue") is not a way to
+        # win a fresh budget. The budget itself (max_turns) is read LIVE from the session config in
+        # _loop, so raising it in Settings takes effect on the next run/continue.
         self._stop.clear()
         self._finished = False
         self._finish_nudges = 0
@@ -188,7 +198,7 @@ class Agent:
             except Exception as e:  # noqa: BLE001
                 self._fail(f"Provider init failed: {e}")
                 return self.result
-        max_turns = int(self.model_config.get("max_turns", 40))
+        max_turns = self._max_turns()
 
         try:
             while self._turns < max_turns:
@@ -323,26 +333,22 @@ class Agent:
                 # Hit the turn budget without calling `finish`. Don't lose the work: have a
                 # summarizer distil this agent's transcript into a HANDOFF (findings + state +
                 # what remains) and use that as the result, so its findings still reach the parent
-                # / orchestrator and the shared/master memory. Helper agents (summarizer /
-                # tool_selector) are excluded — that would recurse and they carry no findings.
-                if self.role in ("summarizer", "tool_selector"):
+                # and the shared/master memory.
+                if self.role in ("orchestrator", "summarizer", "tool_selector"):
+                    # NOT summarized: the orchestrator is the root coordinator (no parent to hand a
+                    # summary to — summarizing it is pointless and just spawns a stray agent), and the
+                    # helper agents (summarizer / tool_selector) carry no findings and would recurse.
+                    # They simply stop at the budget with their current result; the operator can ask
+                    # them to continue, which grants a fresh allowance (see run_followup).
                     self.result = self.result or "Reached maximum turn budget."
-                elif self._exhausted:
-                    # Already did the turn-budget handoff in an earlier run. The budget is preserved
-                    # across stop/re-activation, so a re-engaged agent that is still out of turns must
-                    # NOT spawn another summarizer — just hand back its existing summary.
-                    self.result = self.result or "Out of turn budget (already summarized)."
-                    self._finished = True
-                    self._validated = True
                 else:
                     self.result = await self._summarize_on_exhaustion(max_turns)
-                    # The agent was force-summarized because it ran OUT OF TURNS — an involuntary
-                    # close, not a deliberate `finish`. Do NOT park it in 'waiting_validation': a
-                    # parent might never validate it, leaving it stuck forever with its memory
-                    # unrecorded. Close it as done + auto-accepted; the handoff summary is its result
-                    # and still reaches the parent the same way a finish does. The turn budget is
-                    # PRESERVED on any later re-engagement (run_followup) — it doesn't get a reset.
-                    self._exhausted = True
+                    # A turn-budget close is an INVOLUNTARY close, not a deliberate `finish`. Don't
+                    # park the sub-agent in 'waiting_validation' (a parent that never validates would
+                    # leave it stuck forever with its memory unrecorded): close it done + auto-
+                    # accepted. The handoff summary is its result and reaches the parent the same way
+                    # a finish does. The operator/parent can still re-engage it (run_followup), which
+                    # grants a fresh budget so it can do more work.
                     self._finished = True
                     self._validated = True
 

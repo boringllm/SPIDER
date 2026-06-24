@@ -1445,6 +1445,7 @@ class Session:
     async def resume(self, extra_instructions: str = "") -> None:
         """Resume by re-launching the orchestrator with the prior plan and findings
         as context, plus any new operator instructions."""
+        self.reload_config()   # pick up config changes (e.g. raised max_turns) made since creation
         await self.setup()
         self._set_status("running")
         plan_text = "\n".join(f"  [{s['status']}] {s['text']}" for s in self.plan.get("steps", []))
@@ -1516,15 +1517,40 @@ class Session:
         agent = self.agents.get(agent_id)
         if not agent:
             return "no such agent"
-        # Re-engaging after the session was stopped: revive it first so the agent's MCP tools and
-        # the event log are live again (stop() closed them) and the UI shows it active.
-        if self.status == "stopped":
-            await self.revive()
+        # Re-engaging an idle/finished/stopped session: pick up any config changes (e.g. a raised
+        # max_turns) made in Settings since the session was created, and — if it was stopped —
+        # revive its tools/log. A live session keeps its current config untouched.
+        if self.status != "running":
+            self.reload_config()
+            if self.status == "stopped":
+                await self.revive()
+            else:
+                self._set_status("running")
+                await self.persist()
         agent.deliver(message, sender="operator")
         if not agent.is_running:
             asyncio.create_task(self._resume_agent(agent))
             return "delivered; agent re-activated"
         return "delivered to active agent"
+
+    def reload_config(self) -> None:
+        """Refresh this session's MODEL settings (per-role model/params incl. ``max_turns``, plus
+        pricing and the context budget) from the saved global config. A session otherwise freezes a
+        config SNAPSHOT taken at creation, so a change made in Settings afterwards (e.g. raising
+        ``max_turns``) would never apply; calling this when the session is resumed/continued lets it
+        take effect. Agents read ``max_turns`` live from ``self.cfg`` (see ``Agent._max_turns``), so
+        even already-created agents pick up the new budget; other params apply to agents spawned
+        after the refresh. Structural session fields are left untouched."""
+        try:
+            latest = cfg_mod.load_config()
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(latest.get("models"), dict):
+            self.cfg["models"] = latest["models"]
+        if "pricing" in latest:
+            self.cfg["pricing"] = latest["pricing"]
+        if "max_context_tokens" in latest:
+            self.cfg["max_context_tokens"] = latest["max_context_tokens"]
 
     async def revive(self) -> None:
         """Bring a STOPPED session back to a working state so the operator can resume a

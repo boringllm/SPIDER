@@ -203,6 +203,79 @@ async def test_turn_budget_handoff() -> None:
     await sess.shutdown()
 
 
+async def test_orchestrator_not_summarized_on_exhaustion() -> None:
+    """The orchestrator (root) is NOT summarized when it hits max_turns — there is no parent to hand
+    a summary to, so it just stops at the budget with its current result (no stray summarizer agent),
+    including when the operator continues it."""
+    import tempfile
+
+    from spider import config
+    from spider.db import Database
+    from spider.session import Session
+
+    tmp = Path(tempfile.mkdtemp(prefix="spider_orch_exhaust_"))
+    cfg = _mock_cfg()
+    cfg["workspace_root"] = str(tmp / "workspaces")
+    cfg["agents_dir"] = str(tmp / "agents")
+    config.CONFIG_DIR = tmp / "config"
+    cfg["human_in_the_loop"]["plan_approval"] = "off"   # don't block the orchestrator on approval
+    cfg["models"]["orchestrator"]["max_turns"] = 1      # force exhaustion immediately
+    sess = Session("orch_exhaust", "t", cfg, Database(str(tmp / "o.db")))
+    await sess.setup()
+    orch = await sess.create_agent("orchestrator", "lead the engagement", parent=None)
+    sess.start_agent(orch)
+    res = await asyncio.wait_for(sess.wait_for(orch), timeout=20)
+    check("orchestrator NOT summarized on exhaustion (no summarizer spawned)",
+          not any(a.role == "summarizer" for a in sess.agents.values()))
+    check("orchestrator result is not a handoff summary", not res.startswith("[REACHED MAX TURN BUDGET"))
+    check("exhausted orchestrator closed done", orch.status == "done")
+
+    # continuing the orchestrator must still never spawn a summarizer for it
+    orch.inbox.put_nowait("[Message from operator]: please continue")
+    await asyncio.wait_for(orch.run_followup(), timeout=20)
+    check("orchestrator still never summarized after continue",
+          not any(a.role == "summarizer" for a in sess.agents.values()))
+    await sess.shutdown()
+
+
+async def test_max_turns_live_and_budget_preserved() -> None:
+    """The reported bug: max_turns must be read LIVE from the session config (so raising it in
+    Settings applies on the next continue) and the turn budget must be PRESERVED across re-activation
+    (not reset). Together: an agent that finished near an OLD low limit picks up a raised limit on
+    continue and keeps working — without being handed a fresh count."""
+    import tempfile
+
+    from spider import config
+    from spider.db import Database
+    from spider.session import Session
+
+    tmp = Path(tempfile.mkdtemp(prefix="spider_maxturns_"))
+    cfg = _mock_cfg()
+    cfg["workspace_root"] = str(tmp / "workspaces")
+    cfg["agents_dir"] = str(tmp / "agents")
+    config.CONFIG_DIR = tmp / "config"
+    cfg["models"]["recon"]["max_turns"] = 40
+    sess = Session("maxturns", "t", cfg, Database(str(tmp / "m.db")))
+    await sess.setup()
+    agent = await sess.create_agent("recon", "recon the target", parent=None)
+    check("max_turns read live from session config", agent._max_turns() == 40)
+    sess.start_agent(agent)
+    await asyncio.wait_for(sess.wait_for(agent), timeout=20)
+    check("agent finished cleanly below budget", agent.stopped is False and agent._turns < 40)
+
+    # Simulate having finished NEAR the limit; the operator raises max_turns and continues.
+    agent._turns = 39
+    sess.cfg["models"]["recon"]["max_turns"] = 200       # what reload_config would pick up from disk
+    check("raised max_turns is picked up LIVE (not frozen at creation)", agent._max_turns() == 200)
+    n_summarizers = sum(1 for a in sess.agents.values() if a.role == "summarizer")
+    agent.inbox.put_nowait("[Message from operator]: continue, do a bit more")
+    await asyncio.wait_for(agent.run_followup(), timeout=20)
+    check("turn budget PRESERVED across continue (not reset to 0)", agent._turns >= 39)
+    check("with the raised live limit, continue does not spuriously summarize",
+          sum(1 for a in sess.agents.values() if a.role == "summarizer") == n_summarizers)
+    await sess.shutdown()
+
+
 async def test_reengage_after_stop() -> None:
     """After the operator stops an agent (or the whole session), they can resume a conversation
     with it: run_followup clears the stop flag so the loop runs again instead of breaking out
@@ -478,6 +551,8 @@ def main() -> int:
     print("- end-to-end (mock)");   asyncio.run(test_end_to_end())
     print("- validation & raw");    asyncio.run(test_validation_and_raw_events())
     print("- turn-budget handoff");  asyncio.run(test_turn_budget_handoff())
+    print("- orchestrator not summarized"); asyncio.run(test_orchestrator_not_summarized_on_exhaustion())
+    print("- max_turns live + budget preserved"); asyncio.run(test_max_turns_live_and_budget_preserved())
     print("- re-engage after stop"); asyncio.run(test_reengage_after_stop())
     print(f"\n== {_passed}/{_passed + _failed} checks passed ==")
     return 1 if _failed else 0

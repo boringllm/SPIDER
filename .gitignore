@@ -30,6 +30,10 @@ build/
 dist/
 *.manifest
 
+# IDE / editor local settings
+.idea/
+.vscode/
+
 # Claude Code local artifacts (keep CLAUDE.md — it's project docs)
 .claude/
 .claude.json

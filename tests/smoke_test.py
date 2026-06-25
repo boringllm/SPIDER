@@ -63,11 +63,12 @@ def test_connection_test_and_proxies() -> None:
     no_proxy-aware httpx client only when enabled; the Kali server injects proxy env from _meta;
     and proxy URLs (which embed credentials) are stripped for non-admins."""
     from spider import config
-    from spider.llm import _proxy_http_client, make_provider
+    from spider.llm import _http_client, make_provider
 
     c = config.default_config()
     check("client_proxy block present", "client_proxy" in c and "no_proxy" in c["client_proxy"])
     check("kali_proxy block present", "kali_proxy" in c and "no_proxy" in c["kali_proxy"])
+    check("verify_ssl defaults on per model", c["models"]["orchestrator"].get("verify_ssl") is True)
 
     # 'send hello' round-trip via the mock provider (what Test connection does, minus the HTTP layer)
     prov = make_provider({"provider": "mock", "model": "mock"})
@@ -75,13 +76,19 @@ def test_connection_test_and_proxies() -> None:
                        [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], []))
     check("LLM hello round-trips to a non-empty reply", isinstance(resp.text, str) and len(resp.text) > 0)
 
-    # client proxy -> httpx client only when enabled (None otherwise)
-    check("no client proxy when disabled", _proxy_http_client({"_client_proxy": {"enabled": False}}) is None)
-    hc = _proxy_http_client({"_client_proxy": {"enabled": True, "url": "http://u:p@proxy:8080",
-                                               "no_proxy": ["localhost", "127.0.0.1"]}})
-    check("client proxy httpx client built when enabled", hc is not None)
+    # custom httpx client only when a proxy and/or TLS-off is needed (None otherwise)
+    check("no custom http client by default", _http_client({"_client_proxy": {"enabled": False}}) is None)
+    check("no custom http client when verify on", _http_client({"verify_ssl": True}) is None)
+    hc = _http_client({"_client_proxy": {"enabled": True, "url": "http://u:p@proxy:8080",
+                                         "no_proxy": ["localhost", "127.0.0.1"]}})
+    check("http client built for proxy", hc is not None)
     if hc is not None:
         asyncio.run(hc.aclose())
+    # verify_ssl: false builds a (verify-disabled) client even without a proxy
+    hc2 = _http_client({"verify_ssl": False})
+    check("http client built when TLS verification disabled", hc2 is not None)
+    if hc2 is not None:
+        asyncio.run(hc2.aclose())
 
     # Kali subprocess proxy env injected from _meta, none without it
     from kali_server.tools import _common

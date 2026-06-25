@@ -116,6 +116,10 @@ def _default_model_config(role: str) -> dict[str, Any]:
         "model": model,
         "api_key": "",
         "base_url": "",  # empty -> SDK default endpoint
+        # Verify the LLM endpoint's TLS certificate. Turn OFF only for a self-signed local
+        # endpoint or a TLS-intercepting (MITM) corporate proxy — it disables cert checking
+        # for this model's API calls, so use with care.
+        "verify_ssl": True,
         "max_tokens": 8000,
         "max_turns": 40,
         # How long to wait for an LLM response (seconds) and how many times to retry

@@ -129,27 +129,33 @@ def _clean_header_value(value: str, label: str) -> str:
     return cleaned
 
 
-def _proxy_http_client(cfg: dict[str, Any]):
-    """Build an ``httpx.AsyncClient`` that routes through the configured CLIENT proxy, EXCEPT for
-    the ``no_proxy`` whitelist hosts (which connect directly). Returns None when no proxy applies,
-    so the SDK uses its default client.
+def _http_client(cfg: dict[str, Any]):
+    """Build the ``httpx.AsyncClient`` the LLM SDK should use, when the model config needs custom
+    transport — i.e. a CLIENT proxy and/or disabled TLS verification (``verify_ssl: false``).
+    Returns None when neither applies, so the SDK uses its own default client.
 
     The proxy config travels in the model config under the reserved ``_client_proxy`` key (injected
-    by ``Session.create_agent`` / the LLM-test endpoint). The whitelist is implemented with httpx
-    per-host ``mounts``: ``all://`` goes through the proxy, while each ``all://<host>`` is a direct
-    transport — so localhost / the Kali host / etc. bypass the proxy."""
-    proxy = (cfg or {}).get("_client_proxy") or {}
-    if not (proxy.get("enabled") and str(proxy.get("url") or "").strip()):
-        return None
+    by ``Session.create_agent`` / the LLM-test endpoint). The proxy whitelist is implemented with
+    httpx per-host ``mounts``: ``all://`` goes through the proxy, while each ``all://<host>`` is a
+    direct transport — so localhost / the Kali host / etc. bypass the proxy. ``verify_ssl`` applies
+    to whichever transport(s) are built."""
+    cfg = cfg or {}
+    proxy = cfg.get("_client_proxy") or {}
+    use_proxy = bool(proxy.get("enabled") and str(proxy.get("url") or "").strip())
+    verify = bool(cfg.get("verify_ssl", True))   # default: verify TLS
+    if not use_proxy and verify:
+        return None                              # nothing custom needed
     import httpx
 
-    url = _clean_header_value(str(proxy["url"]).strip(), "proxy URL")
-    mounts: dict[str, Any] = {"all://": httpx.AsyncHTTPTransport(proxy=url)}
-    for host in proxy.get("no_proxy") or []:
-        h = str(host).strip()
-        if h:
-            mounts[f"all://{h}"] = httpx.AsyncHTTPTransport()  # direct — bypass the proxy
-    return httpx.AsyncClient(mounts=mounts)
+    if use_proxy:
+        url = _clean_header_value(str(proxy["url"]).strip(), "proxy URL")
+        mounts: dict[str, Any] = {"all://": httpx.AsyncHTTPTransport(proxy=url, verify=verify)}
+        for host in proxy.get("no_proxy") or []:
+            h = str(host).strip()
+            if h:
+                mounts[f"all://{h}"] = httpx.AsyncHTTPTransport(verify=verify)  # direct, bypass proxy
+        return httpx.AsyncClient(mounts=mounts)
+    return httpx.AsyncClient(verify=verify)      # no proxy, just disabled TLS verification
 
 
 def _apply_timeout_retries(kwargs: dict[str, Any], cfg: dict[str, Any]) -> None:
@@ -197,9 +203,9 @@ class AnthropicProvider(BaseProvider):
         if model_config.get("base_url"):
             kwargs["base_url"] = _clean_header_value(model_config["base_url"], "base_url")
         _apply_timeout_retries(kwargs, model_config)
-        hc = _proxy_http_client(model_config)
+        hc = _http_client(model_config)
         if hc is not None:
-            kwargs["http_client"] = hc          # route LLM calls through the client proxy
+            kwargs["http_client"] = hc          # client proxy and/or disabled TLS verification
         self.client = anthropic.AsyncAnthropic(**kwargs)
 
     @staticmethod
@@ -341,9 +347,9 @@ class OpenAIProvider(BaseProvider):
         if model_config.get("base_url"):
             kwargs["base_url"] = _clean_header_value(model_config["base_url"], "base_url")
         _apply_timeout_retries(kwargs, model_config)
-        hc = _proxy_http_client(model_config)
+        hc = _http_client(model_config)
         if hc is not None:
-            kwargs["http_client"] = hc          # route LLM calls through the client proxy
+            kwargs["http_client"] = hc          # client proxy and/or disabled TLS verification
         self.client = openai.AsyncOpenAI(**kwargs)
 
     @staticmethod

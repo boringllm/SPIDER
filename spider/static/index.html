@@ -227,9 +227,9 @@
           <button class="btn" onclick="testKali()">Test connection</button>
           <span id="kaliTestStatus" class="muted"></span>
         </div>
-        <div class="toolbar">
+        <div class="toggle-row">
           <label class="chk"><input id="outputFilterEnabled" type="checkbox" /> filter tool output (show agents only the notable findings)</label>
-          <span class="muted">Strips banners/progress/log noise from every offensive tool. Agents can still request the full output per call (<code>raw=true</code>); turning this off sends the complete raw output unchanged.</span>
+          <div class="toggle-help muted">Strips banners/progress/log noise from every offensive tool. Agents can still request the full output per call (<code>raw=true</code>); turning this off sends the complete raw output unchanged.</div>
         </div>
 
         <h3>Outbound proxies</h3>
@@ -249,7 +249,7 @@
             <label class="chk"><input id="kaliProxyEnabled" type="checkbox" /> route Kali tool traffic through the proxy</label>
             <label>proxy URL<input id="kaliProxyUrl" type="password" placeholder="http://user:pass@proxy:8080" /></label>
             <label class="wide">no-proxy hosts (one per line)<textarea id="kaliProxyNoProxy" rows="3" placeholder="localhost&#10;127.0.0.1"></textarea></label>
-            <span class="muted">Applied to proxy-aware tools (curl/httpx/gospider/nuclei/wget) via HTTP(S)_PROXY/NO_PROXY; raw-socket tools like nmap can't use an HTTP proxy.</span>
+            <div class="toggle-help muted">Applied to proxy-aware tools (curl/httpx/gospider/nuclei/wget) via HTTP(S)_PROXY/NO_PROXY; raw-socket tools like nmap can't use an HTTP proxy.</div>
           </div>
         </div>
 

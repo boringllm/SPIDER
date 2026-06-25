@@ -846,22 +846,36 @@ function renderPresets() {
       <td class="muted" style="font-size:11px">${esc(p.provider || "")} / ${esc(p.model || "")}</td>
       <td><button class="small danger" onclick="deletePreset('${esc(n)}')">Delete</button></td></tr>`; }).join("") + `</table></div>`;
 }
+// Parse a single model-config input's raw string value into its typed value (shared by save and
+// the connection test, so the test uses exactly what's typed on screen).
+function parseModelValue(key, v) {
+  if (key === "max_tokens" || key === "max_turns") return parseInt(v) || 0;
+  if (key === "max_tool_size" || key === "request_timeout" || key === "max_retries") return Math.max(0, parseInt(v) || 0);
+  if (key === "stop") return v.trim() ? v.split(",").map(s => s.trim()).filter(Boolean) : [];
+  if (NUM_KEYS.includes(key)) return v.trim() === "" ? null : parseFloat(v);
+  if (key === "thinking_budget") return parseInt(v) || 8000;
+  if (key === "verify_ssl") return (v === "true" || v === true);
+  if (key === "param_overrides") {
+    const map = {}; v.split(",").map(s => s.trim()).filter(Boolean).forEach(pair => {
+      const i = pair.indexOf("="); if (i > 0) map[pair.slice(0, i).trim()] = pair.slice(i + 1).trim(); });
+    return map;
+  }
+  return v;
+}
+// The current on-screen model config for one role (typed values), regardless of what's saved.
+function readModelInputs(role) {
+  const out = {};
+  document.querySelectorAll(`[data-role="${role}"][data-key]`).forEach(el => {
+    out[el.dataset.key] = parseModelValue(el.dataset.key, el.value);
+  });
+  return out;
+}
 // Sync the per-agent model inputs from the DOM back into state.config.models.
 function gatherModels() {
   const c = state.config;
   document.querySelectorAll("[data-role]").forEach(el => {
-    const role = el.dataset.role, key = el.dataset.key; if (!key) return; let v = el.value;
-    if (key === "max_tokens" || key === "max_turns") v = parseInt(v) || 0;
-    else if (key === "max_tool_size" || key === "request_timeout" || key === "max_retries") v = Math.max(0, parseInt(v) || 0);
-    else if (key === "stop") v = v.trim() ? v.split(",").map(s => s.trim()).filter(Boolean) : [];
-    else if (NUM_KEYS.includes(key)) v = v.trim() === "" ? null : parseFloat(v);
-    else if (key === "thinking_budget") v = parseInt(v) || 8000;
-    else if (key === "param_overrides") {
-      const map = {}; v.split(",").map(s => s.trim()).filter(Boolean).forEach(pair => {
-        const i = pair.indexOf("="); if (i > 0) map[pair.slice(0, i).trim()] = pair.slice(i + 1).trim(); });
-      v = map;
-    }
-    (c.models[role] = c.models[role] || {})[key] = v;
+    const role = el.dataset.role, key = el.dataset.key; if (!key) return;
+    (c.models[role] = c.models[role] || {})[key] = parseModelValue(key, el.value);
   });
 }
 function applyPreset(role) {
@@ -1007,6 +1021,7 @@ function renderConfig() {
         data-lpignore="true" data-1p-ignore data-form-type="other" value="${esc(m.api_key || "")}"
         ><button type="button" class="reveal" title="show/hide — reveal before copying" onclick="toggleSecret(this)">👁</button></span></label>
       <label>base_url<input data-role="${role}" data-key="base_url" value="${esc(m.base_url || "")}"></label>
+      <label title="Verify the LLM endpoint's TLS certificate. Set false ONLY for a self-signed/local endpoint or a TLS-intercepting proxy — it disables cert checking for this model.">verify_ssl<select data-role="${role}" data-key="verify_ssl">${opt(String(m.verify_ssl !== false), ["true", "false"])}</select></label>
       <label>max_tokens<input data-role="${role}" data-key="max_tokens" type="number" value="${m.max_tokens}"></label>
       <label>max_turns<input data-role="${role}" data-key="max_turns" type="number" value="${m.max_turns}"></label>
       <label title="Max tools given to this model. If exceeded, a tool_selector agent picks the best subset. 0 = unlimited."
@@ -1196,13 +1211,9 @@ async function testKali() {
 async function testLLM(role) {
   const el = document.getElementById(`llmTest-${role}`);
   if (el) el.innerHTML = '<span class="muted">testing… (sending “hello”)</span>';
-  // Read the on-screen connection fields so the test reflects unsaved edits. A blank api_key is
-  // ignored server-side (the saved key is used); other unset fields fall back to the saved config.
-  const params = {};
-  ["provider", "model", "api_key", "base_url"].forEach(k => {
-    const inp = document.querySelector(`[data-role="${role}"][data-key="${k}"]`);
-    if (inp) params[k] = inp.value;
-  });
+  // Send the CURRENT on-screen model config (typed values), so the test reflects unsaved edits —
+  // not just what's persisted. A blank api_key is ignored server-side (the saved key is used).
+  const params = readModelInputs(role);
   try {
     const r = await api("/api/config/llm/test", "POST", { role, params });
     if (!el) return;

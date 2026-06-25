@@ -309,7 +309,13 @@ th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--bord
 .proc-killed { color: var(--red); font-size: 11px; }
 .hrow-interject { display: flex; gap: 6px; align-items: center; }
 .hrow-interject input { padding: 6px 8px; }
-label.chk { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+label.chk { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; }
+/* keep the box flush with its label text (no default checkbox margins throwing off alignment) */
+label.chk input[type="checkbox"] { margin: 0; flex: none; width: 14px; height: 14px; }
+/* an on/off toggle with help text on its own line below, indented under the checkbox — used by the
+   "filter tool output" and proxy toggles so they line up consistently */
+.toggle-row { margin: 8px 0 12px; }
+.toggle-help { margin: 3px 0 0 22px; font-size: 11px; line-height: 1.4; }
 .plan-approval { background: #221833; border-color: var(--purple, #9a6cff); }
 .plan-approval .plan-steps { display: flex; flex-direction: column; margin: 6px 0; }
 .plan-approval .plan-steps input { font-size: 12px; padding: 4px 6px; }

@@ -232,6 +232,27 @@
           <span class="muted">Strips banners/progress/log noise from every offensive tool. Agents can still request the full output per call (<code>raw=true</code>); turning this off sends the complete raw output unchanged.</span>
         </div>
 
+        <h3>Outbound proxies</h3>
+        <p class="muted" style="margin:0 0 8px">Authenticated HTTP proxy in the form
+          <code>http://user:pass@host:port</code>. The two are independent. Hosts in the
+          no-proxy list connect <b>directly</b> (one per line; e.g. <code>localhost</code>,
+          <code>127.0.0.1</code>, <code>host.docker.internal</code>).</p>
+        <div class="config-grid">
+          <div class="config-role">
+            <h4>Client proxy <span class="muted" style="font-weight:normal">— Spider's own outbound (the LLM API)</span></h4>
+            <label class="chk"><input id="clientProxyEnabled" type="checkbox" /> route the control app's LLM calls through the proxy</label>
+            <label>proxy URL<input id="clientProxyUrl" type="password" placeholder="http://user:pass@proxy:8080" /></label>
+            <label class="wide">no-proxy hosts (one per line)<textarea id="clientProxyNoProxy" rows="3" placeholder="localhost&#10;127.0.0.1"></textarea></label>
+          </div>
+          <div class="config-role">
+            <h4>Kali proxy <span class="muted" style="font-weight:normal">— offensive tools in the container</span></h4>
+            <label class="chk"><input id="kaliProxyEnabled" type="checkbox" /> route Kali tool traffic through the proxy</label>
+            <label>proxy URL<input id="kaliProxyUrl" type="password" placeholder="http://user:pass@proxy:8080" /></label>
+            <label class="wide">no-proxy hosts (one per line)<textarea id="kaliProxyNoProxy" rows="3" placeholder="localhost&#10;127.0.0.1"></textarea></label>
+            <span class="muted">Applied to proxy-aware tools (curl/httpx/gospider/nuclei/wget) via HTTP(S)_PROXY/NO_PROXY; raw-socket tools like nmap can't use an HTTP proxy.</span>
+          </div>
+        </div>
+
         <h3>Sub-agent spawning limits</h3>
         <p class="muted" style="margin:0 0 8px">Bound how the agent tree can grow. Framework helper agents
           (tool_selector / summarizer) don't count toward the per-agent limit.</p>

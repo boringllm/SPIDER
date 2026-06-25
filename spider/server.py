@@ -100,6 +100,9 @@ def _sanitize_config(cfg: dict) -> dict:
             mc["api_key"] = ""
     if isinstance(c.get("kali"), dict):
         c["kali"]["token"] = ""   # the Kali bearer token is a secret too
+    for pk in ("client_proxy", "kali_proxy"):
+        if isinstance(c.get(pk), dict) and c[pk].get("url"):
+            c[pk]["url"] = ""     # the proxy URL embeds id:password credentials (admin-only)
     return c
 
 
@@ -168,6 +171,13 @@ class KaliTest(BaseModel):
     # sentinel "\x00keep" to mean "use the saved token" (so a masked field needn't round-trip it).
     url: str = ""
     token: str = "\x00keep"
+
+
+class LLMTest(BaseModel):
+    # Which role's model to test, plus optional unsaved model-config overrides from the UI. A blank
+    # api_key in ``params`` is ignored so the saved key is used (the UI needn't echo the secret).
+    role: str = "orchestrator"
+    params: dict[str, Any] | None = None
 
 
 # ---- Spider human-in-the-loop request models ----
@@ -355,6 +365,45 @@ async def test_kali(body: KaliTest, admin: User = Depends(require_admin)) -> dic
                 "error": f"{type(e).__name__}: {e}"}
     finally:
         await client.close()
+
+
+@app.post("/api/config/llm/test")
+async def test_llm(body: LLMTest, admin: User = Depends(require_admin)) -> dict:
+    """Check that the configured LLM actually answers: build the role's model config (saved, with
+    any unsaved UI overrides applied), send a one-line 'hello', and return the model's reply.
+
+    Routes through the client proxy when one is enabled, so this also validates the proxy path.
+    Returns ``{ok, role, model, reply, via_proxy, error}`` — the Settings → Models 'Test' button."""
+    from .llm import make_provider
+
+    cfg = cfg_mod.load_config()
+    role = body.role or "orchestrator"
+    mc = deepcopy(cfg["models"].get(role) or cfg["models"].get("orchestrator") or {})
+    for k, v in (body.params or {}).items():
+        if k == "api_key" and not (v and str(v).strip()):
+            continue   # keep the saved key when the UI sends a blank/masked field
+        mc[k] = v
+    mc["_client_proxy"] = cfg.get("client_proxy")
+    via_proxy = bool((cfg.get("client_proxy") or {}).get("enabled")
+                     and (cfg.get("client_proxy") or {}).get("url"))
+    model = mc.get("model", "")
+    try:
+        provider = make_provider(mc)
+        resp = await provider.complete(
+            "You are a connectivity check for the Spider pentest tool. Reply with one short, friendly sentence.",
+            [{"role": "user", "content": [{"type": "text",
+              "text": "Hello! This is a connection test from Spider — please reply with a brief greeting."}]}],
+            [],
+        )
+        reply = (resp.text or "").strip()
+        if not reply:
+            return {"ok": False, "role": role, "model": model, "reply": "", "via_proxy": via_proxy,
+                    "error": "Connected, but the model returned an empty reply."}
+        return {"ok": True, "role": role, "model": model, "reply": reply[:500],
+                "via_proxy": via_proxy, "error": ""}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "role": role, "model": model, "reply": "", "via_proxy": via_proxy,
+                "error": f"{type(e).__name__}: {e}"}
 
 
 @app.get("/api/tools")

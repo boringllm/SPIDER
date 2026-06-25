@@ -33,6 +33,26 @@ except ValueError:
 _SEM: asyncio.Semaphore | None = None
 
 
+def _subprocess_env():
+    """Environment for a tool subprocess. When Spider sent kali_proxy settings in the JSON-RPC
+    ``_meta`` (stashed in ``_procs.CURRENT_META``), inject HTTP(S)_PROXY / ALL_PROXY and NO_PROXY so
+    proxy-aware tools (curl, wget, httpx, gospider, nuclei, ...) route through the proxy, with the
+    whitelist hosts bypassing it. Returns None to inherit the parent env unchanged (no proxy set).
+    Raw-socket tools like nmap ignore these vars — that's inherent to how they work."""
+    meta = _procs.CURRENT_META.get() or {}
+    proxy = meta.get("proxy") or {}
+    url = str(proxy.get("url") or "").strip()
+    if not url:
+        return None
+    env = dict(os.environ)
+    for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        env[k] = url
+    no_proxy = ",".join(str(h).strip() for h in (proxy.get("no_proxy") or []) if str(h).strip())
+    if no_proxy:
+        env["NO_PROXY"] = env["no_proxy"] = no_proxy
+    return env
+
+
 def _limiter():
     """Return the shared concurrency limiter as an async context manager. Lazily creates the
     semaphore on first use (so it binds to the running event loop), or a no-op context when the
@@ -151,6 +171,7 @@ async def run(argv: list[str], timeout: int = DEFAULT_TIMEOUT, input_text: str |
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
+                env=_subprocess_env(),
             )
         except FileNotFoundError as e:
             return f"[error] executable not found: {e}"
@@ -185,7 +206,7 @@ async def run_shell(command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
         try:
             proc = await asyncio.create_subprocess_shell(
                 command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
+                start_new_session=True, env=_subprocess_env(),
             )
         except FileNotFoundError as e:
             return f"[error] shell not available: {e}"

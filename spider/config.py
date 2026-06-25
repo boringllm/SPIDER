@@ -219,6 +219,24 @@ def default_config() -> dict[str, Any]:
             "token": "",
             "assign_roles": ["recon", "web_app", "network", "exploitation", "post_exploit"],
         },
+        # ---- Outbound proxies (separate for the control app vs. the Kali container) -----
+        # An authenticated proxy in the form http://user:pass@host:port. They are INDEPENDENT:
+        # the client can route through one while Kali doesn't (or vice-versa).
+        #   • client_proxy : the Spider control app uses it for its OUTBOUND connections — chiefly
+        #     the LLM API. Hosts in `no_proxy` connect DIRECTLY (bypass the proxy).
+        #   • kali_proxy   : pushed to the Kali container; its tools' subprocesses get HTTP(S)_PROXY
+        #     / NO_PROXY env so curl/httpx/gospider/nuclei/wget route through it (raw-socket tools
+        #     like nmap can't use an HTTP proxy). Hosts in `no_proxy` bypass it.
+        "client_proxy": {
+            "enabled": False,
+            "url": "",   # http://user:pass@host:port
+            "no_proxy": ["localhost", "127.0.0.1", "::1", "host.docker.internal"],
+        },
+        "kali_proxy": {
+            "enabled": False,
+            "url": "",   # http://user:pass@host:port
+            "no_proxy": ["localhost", "127.0.0.1", "::1"],
+        },
         # ---- Offensive-tool output filtering ------------------------------------
         # When enabled, the Kali server statically filters each tool's output down to its
         # notable findings before the agent sees it (less noise / context waste). Agents can

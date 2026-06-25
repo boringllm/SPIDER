@@ -436,6 +436,9 @@ class Session:
         count = sum(1 for a in self.agents.values() if a.role == role) + 1
         name = f"{role}#{count}" if role != "orchestrator" else "orchestrator"
         model_config = deepcopy(self.cfg["models"].get(role) or self.cfg["models"]["orchestrator"])
+        # Route this agent's LLM calls through the operator's client proxy (if enabled). Read live
+        # from the session config so a proxy change applies on the next agent created/resumed.
+        model_config["_client_proxy"] = self.cfg.get("client_proxy")
 
         is_helper = role in _HELPER_ROLES
         tools = self._tools_for_role(role)

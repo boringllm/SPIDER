@@ -978,6 +978,13 @@ function renderConfig() {
   document.getElementById("kaliUrl").value = kali.url || "";
   document.getElementById("kaliToken").value = kali.token || "";
   document.getElementById("outputFilterEnabled").checked = (c.output_filter || {}).enabled !== false;
+  const cp = c.client_proxy || {}, kp = c.kali_proxy || {};
+  document.getElementById("clientProxyEnabled").checked = !!cp.enabled;
+  document.getElementById("clientProxyUrl").value = cp.url || "";
+  document.getElementById("clientProxyNoProxy").value = (cp.no_proxy || []).join("\n");
+  document.getElementById("kaliProxyEnabled").checked = !!kp.enabled;
+  document.getElementById("kaliProxyUrl").value = kp.url || "";
+  document.getElementById("kaliProxyNoProxy").value = (kp.no_proxy || []).join("\n");
   renderToolApproval();
   const opt = (cur, vals) => vals.map(v => `<option ${cur === v ? "selected" : ""}>${v}</option>`).join("");
   const num = (role, key, m) => `<label>${key}<input data-role="${role}" data-key="${key}" type="number" step="any" value="${m[key] == null ? "" : m[key]}"></label>`;
@@ -989,6 +996,8 @@ function renderConfig() {
         <select id="presetsel-${role}" style="height:26px">${presetOpts}</select>
         <button class="small" onclick="applyPreset('${role}')">Apply</button>
         <button class="small" onclick="saveAsPreset('${role}')">Save as preset…</button>
+        <button class="small" onclick="testLLM('${role}')" title="Send a 'hello' to this model and show the reply">Test connection</button>
+        <span id="llmTest-${role}" class="muted" style="font-weight:normal"></span>
       </span></h4><div class="config-grid">
       <label>provider<select data-role="${role}" data-key="provider">${opt(m.provider, ["anthropic", "openai", "mock"])}</select></label>
       <label>model<input data-role="${role}" data-key="model" value="${esc(m.model)}"></label>
@@ -1183,6 +1192,28 @@ async function testKali() {
     }
   } catch (e) { if (el) { el.textContent = "✗ " + e.message; el.style.color = "var(--red)"; } }
 }
+async function testLLM(role) {
+  const el = document.getElementById(`llmTest-${role}`);
+  if (el) { el.textContent = "testing… (sending hello)"; el.style.color = "var(--muted)"; }
+  // Read the on-screen connection fields so the test reflects unsaved edits. A blank api_key is
+  // ignored server-side (the saved key is used); other unset fields fall back to the saved config.
+  const params = {};
+  ["provider", "model", "api_key", "base_url"].forEach(k => {
+    const inp = document.querySelector(`[data-role="${role}"][data-key="${k}"]`);
+    if (inp) params[k] = inp.value;
+  });
+  try {
+    const r = await api("/api/config/llm/test", "POST", { role, params });
+    if (!el) return;
+    if (r.ok) {
+      el.textContent = `✓ ${r.model} replied${r.via_proxy ? " (via proxy)" : ""}: “${(r.reply || "").slice(0, 120)}”`;
+      el.style.color = "var(--green)";
+    } else {
+      el.textContent = "✗ " + (r.error || "failed");
+      el.style.color = "var(--red)";
+    }
+  } catch (e) { if (el) { el.textContent = "✗ " + e.message; el.style.color = "var(--red)"; } }
+}
 async function saveAgentDef(i) {
   const d = state.agentDefs[i];
   const prompt = document.getElementById(`adef-prompt-${i}`).value;
@@ -1226,6 +1257,18 @@ async function saveConfig() {
   if (!c.kali.assign_roles) c.kali.assign_roles = ["recon", "web_app", "network", "exploitation", "post_exploit"];
   c.output_filter = c.output_filter || {};
   c.output_filter.enabled = document.getElementById("outputFilterEnabled").checked;
+  // Outbound proxies (client + kali). no_proxy is one host per line.
+  const lines = id => document.getElementById(id).value.split("\n").map(s => s.trim()).filter(Boolean);
+  c.client_proxy = {
+    enabled: document.getElementById("clientProxyEnabled").checked,
+    url: document.getElementById("clientProxyUrl").value.trim(),
+    no_proxy: lines("clientProxyNoProxy"),
+  };
+  c.kali_proxy = {
+    enabled: document.getElementById("kaliProxyEnabled").checked,
+    url: document.getElementById("kaliProxyUrl").value.trim(),
+    no_proxy: lines("kaliProxyNoProxy"),
+  };
   // Tool-approval policy
   const pol = c.tool_approval = c.tool_approval || { by_category: {}, always_manual_tools: [], always_auto_tools: [] };
   pol.default = document.getElementById("toolApprovalDefault").value;

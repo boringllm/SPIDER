@@ -57,6 +57,50 @@ def test_tools_categorised() -> None:
     check("tool_catalog exposes category", cat["terminal"]["category"] == "shell")
 
 
+def test_connection_test_and_proxies() -> None:
+    """LLM connection-test + proxy plumbing: config blocks exist; a 'hello' round-trips through a
+    provider (the mechanism behind Settings → Test connection); the client proxy builds a
+    no_proxy-aware httpx client only when enabled; the Kali server injects proxy env from _meta;
+    and proxy URLs (which embed credentials) are stripped for non-admins."""
+    from spider import config
+    from spider.llm import _proxy_http_client, make_provider
+
+    c = config.default_config()
+    check("client_proxy block present", "client_proxy" in c and "no_proxy" in c["client_proxy"])
+    check("kali_proxy block present", "kali_proxy" in c and "no_proxy" in c["kali_proxy"])
+
+    # 'send hello' round-trip via the mock provider (what Test connection does, minus the HTTP layer)
+    prov = make_provider({"provider": "mock", "model": "mock"})
+    resp = asyncio.run(prov.complete("connectivity check",
+                       [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], []))
+    check("LLM hello round-trips to a non-empty reply", isinstance(resp.text, str) and len(resp.text) > 0)
+
+    # client proxy -> httpx client only when enabled (None otherwise)
+    check("no client proxy when disabled", _proxy_http_client({"_client_proxy": {"enabled": False}}) is None)
+    hc = _proxy_http_client({"_client_proxy": {"enabled": True, "url": "http://u:p@proxy:8080",
+                                               "no_proxy": ["localhost", "127.0.0.1"]}})
+    check("client proxy httpx client built when enabled", hc is not None)
+    if hc is not None:
+        asyncio.run(hc.aclose())
+
+    # Kali subprocess proxy env injected from _meta, none without it
+    from kali_server.tools import _common
+    from kali_server.tools._procs import CURRENT_META
+    CURRENT_META.set({"proxy": {"url": "http://u:p@px:3128", "no_proxy": ["localhost", "10.0.0.0/8"]}})
+    env = _common._subprocess_env()
+    check("kali proxy env set from _meta", bool(env) and env.get("HTTPS_PROXY") == "http://u:p@px:3128")
+    check("kali no_proxy env set", bool(env) and "localhost" in (env.get("NO_PROXY") or ""))
+    CURRENT_META.set({})
+    check("no kali proxy env without _meta proxy", _common._subprocess_env() is None)
+
+    # proxy URLs (embed id:password) are stripped for non-admins
+    from spider.server import _sanitize_config
+    c["client_proxy"]["url"] = c["kali_proxy"]["url"] = "http://u:secret@px:8080"
+    san = _sanitize_config(c)
+    check("client proxy url stripped for non-admin", san["client_proxy"]["url"] == "")
+    check("kali proxy url stripped for non-admin", san["kali_proxy"]["url"] == "")
+
+
 def test_approval_policy() -> None:
     from spider import config
     from spider.db import Database
@@ -542,6 +586,7 @@ def main() -> int:
     print("- config & roles");      test_config_and_roles()
     print("- tools categorised");   test_tools_categorised()
     print("- approval policy");     test_approval_policy()
+    print("- llm test + proxies");  test_connection_test_and_proxies()
     print("- poc execution policy"); test_poc_execution_policy()
     print("- reference documents"); test_reference_documents()
     print("- report docx/template"); test_report_docx_and_template()

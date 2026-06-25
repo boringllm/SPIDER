@@ -181,7 +181,17 @@ touch their own sessions.
 
 In **Settings → Models** put your `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`) — or set it in the
 environment and leave the field blank. You can try the whole flow with **provider = mock** and no
-key.
+key. Click **Test connection** on any model to send it a quick "hello" and see the reply — a fast
+way to confirm the key, base URL, model name (and the proxy, if enabled) all work before a run.
+
+**Outbound proxies (optional).** In **Settings → Outbound proxies** you can route traffic through an
+authenticated HTTP proxy `http://user:pass@host:port`. The two proxies are independent:
+- **Client proxy** — the Spider control app's own outbound traffic (chiefly the **LLM API**).
+- **Kali proxy** — the offensive tools in the container (curl/httpx/gospider/nuclei/wget via
+  `HTTP(S)_PROXY`; raw-socket tools like nmap can't use an HTTP proxy).
+
+Each has a **no-proxy whitelist** (one host per line, e.g. `localhost`, `127.0.0.1`,
+`host.docker.internal`) whose hosts connect **directly**, bypassing the proxy.
 
 ### 2. Kali tool server (pre-configured Docker image)
 The offensive tools run in a **pre-configured Kali container**. A published build is on Docker Hub, so

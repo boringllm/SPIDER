@@ -99,6 +99,14 @@ for the lifetime of each tool. When the cap is reached, further tool calls **que
 piling more load on the container/target — a backstop that complements the per-session intensity knob
 and the manual kill.
 
+## Proxying tool traffic
+Spider can push a **Kali proxy** to the server (Settings → Outbound proxies) so the offensive tools
+route through an authenticated HTTP proxy. It travels in the JSON-RPC `_meta` of each tool call;
+`tools/_common._subprocess_env` then sets `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (and `NO_PROXY` for
+the whitelist) on the tool subprocess. Proxy-aware tools (curl, wget, httpx, gospider, nuclei, …)
+honour it; raw-socket tools like nmap can't use an HTTP proxy. This is independent of the Spider
+control app's own (client) proxy. No container env/restart is needed — it applies per tool call.
+
 ## Reaching a target on the operator's own host
 Tools run *inside* the container, where `127.0.0.1` is the container itself. To hit a target on the
 **operator's host loopback**, use `host.docker.internal` (the compose file maps it via `extra_hosts`

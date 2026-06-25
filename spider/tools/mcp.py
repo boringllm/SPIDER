@@ -240,6 +240,11 @@ def _make_handler(client: MCPClient, tool_name: str):
         filt = bool(((agent.session.cfg.get("output_filter") or {}).get("enabled", True)))
         meta = {"session": agent.session.id, "agent": agent.id,
                 "agent_name": agent.name, "tool": tool_name, "filter": filt}
+        # `proxy` carries the Kali-side proxy settings so the server can route tool subprocesses
+        # (curl/httpx/gospider/nuclei/wget) through it via HTTP(S)_PROXY/NO_PROXY env vars.
+        kp = agent.session.cfg.get("kali_proxy") or {}
+        if kp.get("enabled") and str(kp.get("url") or "").strip():
+            meta["proxy"] = {"url": str(kp["url"]).strip(), "no_proxy": kp.get("no_proxy") or []}
         return await client.call_tool(tool_name, args, meta=meta)
 
     return handler

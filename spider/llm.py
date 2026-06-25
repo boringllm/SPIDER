@@ -129,6 +129,29 @@ def _clean_header_value(value: str, label: str) -> str:
     return cleaned
 
 
+def _proxy_http_client(cfg: dict[str, Any]):
+    """Build an ``httpx.AsyncClient`` that routes through the configured CLIENT proxy, EXCEPT for
+    the ``no_proxy`` whitelist hosts (which connect directly). Returns None when no proxy applies,
+    so the SDK uses its default client.
+
+    The proxy config travels in the model config under the reserved ``_client_proxy`` key (injected
+    by ``Session.create_agent`` / the LLM-test endpoint). The whitelist is implemented with httpx
+    per-host ``mounts``: ``all://`` goes through the proxy, while each ``all://<host>`` is a direct
+    transport — so localhost / the Kali host / etc. bypass the proxy."""
+    proxy = (cfg or {}).get("_client_proxy") or {}
+    if not (proxy.get("enabled") and str(proxy.get("url") or "").strip()):
+        return None
+    import httpx
+
+    url = _clean_header_value(str(proxy["url"]).strip(), "proxy URL")
+    mounts: dict[str, Any] = {"all://": httpx.AsyncHTTPTransport(proxy=url)}
+    for host in proxy.get("no_proxy") or []:
+        h = str(host).strip()
+        if h:
+            mounts[f"all://{h}"] = httpx.AsyncHTTPTransport()  # direct — bypass the proxy
+    return httpx.AsyncClient(mounts=mounts)
+
+
 def _apply_timeout_retries(kwargs: dict[str, Any], cfg: dict[str, Any]) -> None:
     """Pass the configured per-LLM-call timeout (seconds) and retry count to the SDK client."""
     to = cfg.get("request_timeout")
@@ -174,6 +197,9 @@ class AnthropicProvider(BaseProvider):
         if model_config.get("base_url"):
             kwargs["base_url"] = _clean_header_value(model_config["base_url"], "base_url")
         _apply_timeout_retries(kwargs, model_config)
+        hc = _proxy_http_client(model_config)
+        if hc is not None:
+            kwargs["http_client"] = hc          # route LLM calls through the client proxy
         self.client = anthropic.AsyncAnthropic(**kwargs)
 
     @staticmethod
@@ -315,6 +341,9 @@ class OpenAIProvider(BaseProvider):
         if model_config.get("base_url"):
             kwargs["base_url"] = _clean_header_value(model_config["base_url"], "base_url")
         _apply_timeout_retries(kwargs, model_config)
+        hc = _proxy_http_client(model_config)
+        if hc is not None:
+            kwargs["http_client"] = hc          # route LLM calls through the client proxy
         self.client = openai.AsyncOpenAI(**kwargs)
 
     @staticmethod

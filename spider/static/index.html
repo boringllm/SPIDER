@@ -10,7 +10,7 @@
   <!-- Auth gate: shown until the user is authenticated. First run shows 'create admin'. -->
   <div id="authOverlay" class="overlay auth-overlay">
     <div class="auth-card">
-      <h1 title="Security Pentester AI Driven: Exploitation and Reconnaissance">🕷 SPAIDER</h1>
+      <h1 title="Security Pentester AI Driven: Exploitation and Reconnaissance"><span class="brand-logo">🕷</span> SPAIDER</h1>
       <p class="muted" style="margin:-4px 0 8px;font-size:11px">Security Pentester AI Driven: Exploitation and Reconnaissance</p>
       <div id="authLogin" class="hidden">
         <h3>Sign in</h3>
@@ -37,7 +37,7 @@
 
   <div class="app">
     <aside class="sidebar" id="sidebar">
-      <h1 title="Security Pentester AI Driven: Exploitation and Reconnaissance">🕷 SPAIDER<br><small>autonomous pentest</small></h1>
+      <h1 title="Security Pentester AI Driven: Exploitation and Reconnaissance"><span class="brand-logo">🕷</span> SPAIDER<br><small>AI assisted pentest</small></h1>
       <div class="session-list" id="sessionList"></div>
       <div class="actions user-bar" id="userBar">
         <span id="userLabel" class="muted"></span>
@@ -378,6 +378,20 @@
   </div>
 
   <!-- Prompt view modal -->
+  <!-- Risk / responsibility disclaimer (shown only when the hidden SPAIDER_REQUIRE_DISCLAIMER env
+       var is set). Gates starting an engagement and bypassing the approval gate. -->
+  <div id="disclaimerModal" class="hidden modal-wrap">
+    <div class="card disclaimer-card" style="width:600px;max-height:88vh;overflow:auto;margin:0">
+      <h3 id="disclaimerTitle" class="disclaimer-title">⚠️ Before you continue</h3>
+      <div id="disclaimerBody" class="disclaimer-body"></div>
+      <div class="disclaimer-actions">
+        <button onclick="resolveDisclaimer(false)">Cancel</button>
+        <span class="grow"></span>
+        <button class="primary danger-confirm" onclick="resolveDisclaimer(true)">I understand the risks &amp; accept full responsibility</button>
+      </div>
+    </div>
+  </div>
+
   <div id="promptModal" class="hidden modal-wrap">
     <div class="card" style="width:680px;max-height:80vh;overflow:auto;margin:0">
       <h3>System prompt — <span id="promptAgentName"></span></h3>

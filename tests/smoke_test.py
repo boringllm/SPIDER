@@ -120,6 +120,62 @@ def test_connection_test_and_proxies() -> None:
     check("full error includes a traceback", "Traceback" in full)
 
 
+def test_env_loader() -> None:
+    """The dependency-free .env loader parses quotes/spaces/comments/export, doesn't override a
+    real shell variable, and (with override) does. This is what lets SPAIDER_REQUIRE_DISCLAIMER (and
+    API keys) live in a .env file instead of being exported."""
+    import os
+    import tempfile
+
+    from spider._env import load_env
+
+    p = Path(tempfile.mkdtemp(prefix="spider_env_")) / ".env"
+    p.write_text(
+        "# a comment\n"
+        'SPIDER_TEST_QUOTED = "1"\n'
+        "export SPIDER_TEST_EXPORT=yes\n"
+        "SPIDER_TEST_PLAIN=http://u:p@h:8080/path#frag\n"   # '#' must stay (not an inline comment)
+        "\n"
+        "SPIDER_TEST_PREEXISTING=fromfile\n",
+        encoding="utf-8",
+    )
+    for k in ("SPIDER_TEST_QUOTED", "SPIDER_TEST_EXPORT", "SPIDER_TEST_PLAIN", "SPIDER_TEST_PREEXISTING"):
+        os.environ.pop(k, None)
+    os.environ["SPIDER_TEST_PREEXISTING"] = "fromshell"  # a real var the file must NOT clobber
+
+    n = load_env(p)
+    check("loader applied the new keys", n == 3)
+    check("quoted value unquoted + spaces trimmed", os.environ.get("SPIDER_TEST_QUOTED") == "1")
+    check("export prefix handled", os.environ.get("SPIDER_TEST_EXPORT") == "yes")
+    check("'#' inside a value is preserved", os.environ.get("SPIDER_TEST_PLAIN") == "http://u:p@h:8080/path#frag")
+    check("existing shell var not overridden", os.environ.get("SPIDER_TEST_PREEXISTING") == "fromshell")
+
+    load_env(p, override=True)
+    check("override=True lets the file win", os.environ.get("SPIDER_TEST_PREEXISTING") == "fromfile")
+    check("missing file -> 0", load_env(p.parent / "nope.env") == 0)
+
+    for k in ("SPIDER_TEST_QUOTED", "SPIDER_TEST_EXPORT", "SPIDER_TEST_PLAIN", "SPIDER_TEST_PREEXISTING"):
+        os.environ.pop(k, None)
+
+
+def test_disclaimer_flag() -> None:
+    """The hidden risk-disclaimer feature is gated by the SPAIDER_REQUIRE_DISCLAIMER env var
+    (read per-request), and surfaced to the SPA via /api/auth/status."""
+    import os
+
+    from spider.server import _disclaimer_required
+
+    os.environ.pop("SPAIDER_REQUIRE_DISCLAIMER", None)
+    check("disclaimer off by default", _disclaimer_required() is False)
+    for v in ("1", "true", "YES", "on"):
+        os.environ["SPAIDER_REQUIRE_DISCLAIMER"] = v
+        check(f"disclaimer ON for {v!r}", _disclaimer_required() is True)
+    for v in ("0", "false", "", "no"):
+        os.environ["SPAIDER_REQUIRE_DISCLAIMER"] = v
+        check(f"disclaimer OFF for {v!r}", _disclaimer_required() is False)
+    os.environ.pop("SPAIDER_REQUIRE_DISCLAIMER", None)
+
+
 def test_approval_policy() -> None:
     from spider import config
     from spider.db import Database
@@ -663,6 +719,8 @@ def main() -> int:
     print("- config & roles");      test_config_and_roles()
     print("- tools categorised");   test_tools_categorised()
     print("- approval policy");     test_approval_policy()
+    print("- .env loader");         test_env_loader()
+    print("- disclaimer flag");     test_disclaimer_flag()
     print("- llm test + proxies");  test_connection_test_and_proxies()
     print("- poc execution policy"); test_poc_execution_policy()
     print("- reference documents"); test_reference_documents()

@@ -1,5 +1,11 @@
 "use strict";
 
+// Brand mark used in desktop notifications. theme.py rewrites these two values when switching
+// themes: an emoji theme sets BRAND_LOGO to the glyph (and leaves BRAND_ICON empty); a PNG theme
+// clears BRAND_LOGO and points BRAND_ICON at the logo image URL.
+const BRAND_LOGO = "🕷";
+const BRAND_ICON = "";
+
 // Tools shown in the "Commands executed" panel — local shell/terminal + any Kali tool
 // (kali__*) is matched dynamically in trackCommand.
 const CMD_TOOLS = new Set(["run_shell", "run_process", "terminal", "kali_terminal", "http_request"]);
@@ -560,7 +566,10 @@ function alertOperator(title, body) {
   try {
     if (window.Notification) {
       if (Notification.permission === "granted") {
-        new Notification("🕷 SPAIDER — " + title, { body: body.slice(0, 180) });
+        // BRAND_LOGO / BRAND_ICON are rewritten by theme.py: an emoji theme keeps the glyph in
+        // the title (no icon); a PNG theme clears the glyph and sets the notification icon image.
+        const _t = (BRAND_LOGO ? BRAND_LOGO + " " : "") + "SPAIDER — " + title;
+        new Notification(_t, { body: body.slice(0, 180), icon: BRAND_ICON || undefined });
       } else if (Notification.permission !== "denied") {
         Notification.requestPermission().catch(() => {});
       }
@@ -691,9 +700,62 @@ async function changeIntensity() {
   try { await api(`/api/sessions/${state.current}/intensity`, "POST", { intensity }); state.intensity = intensity; }
   catch (e) { alert(e.message); }
 }
+// ----------------------------------------------------------- risk disclaimer
+// Hidden feature (server env var SPAIDER_REQUIRE_DISCLAIMER): force the operator to read & accept a
+// responsibility/risk warning before starting an engagement or bypassing the approval gate. Returns
+// a Promise that resolves true (accepted) or false (cancelled). When the flag is off it resolves
+// true immediately, so callers can always `await` it.
+let _disclaimerResolve = null;
+function showDisclaimer(context) {
+  if (!state.requireDisclaimer) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    _disclaimerResolve = resolve;
+    document.getElementById("disclaimerTitle").textContent = context === "bypass"
+      ? "⚠️ Disabling the approval gate — read this first"
+      : "⚠️ Before you start this engagement";
+    document.getElementById("disclaimerBody").innerHTML = disclaimerHtml(context);
+    document.getElementById("disclaimerModal").classList.remove("hidden");
+  });
+}
+function resolveDisclaimer(accepted) {
+  document.getElementById("disclaimerModal").classList.add("hidden");
+  const r = _disclaimerResolve; _disclaimerResolve = null;
+  if (r) r(!!accepted);
+}
+function disclaimerHtml(context) {
+  const common = `
+    <p class="lead">SPAIDER is an autonomous, LLM-driven tool that runs <strong>real offensive
+      security tooling</strong>. By continuing you confirm that you understand and accept the
+      following.</p>
+    <ul>
+      <li><strong>You are solely responsible</strong> for everything SPAIDER does under your session —
+        legally and operationally.</li>
+      <li><strong>Authorised targets only.</strong> Run it exclusively against systems you own or have
+        explicit written permission to test. Staying in scope is your responsibility.</li>
+      <li><strong>The LLM can hallucinate and make mistakes</strong> — it may misidentify targets,
+        run the wrong command, misjudge scope, or take unexpected actions.</li>
+      <li><strong>Findings, severities and reports may be inaccurate or incomplete.</strong>
+        Independently re-verify everything before acting on or sharing it.</li>
+      <li>The tools can be <strong>intrusive or destructive</strong> and may disrupt or damage target
+        systems and data.</li>
+      <li>SPAIDER is provided <strong>without warranty</strong>; you use it entirely at your own risk.</li>
+    </ul>`;
+  const bypass = `
+    <p class="lead">You are about to turn OFF the human approval gate for this session.</p>
+    <ul>
+      <li>Tools — <strong>including exploit, brute-force and destructive categories</strong> — will run
+        <strong>automatically, without asking you first</strong>.</li>
+      <li>This significantly increases the risk of unintended, out-of-scope or destructive actions.</li>
+    </ul>`;
+  return (context === "bypass" ? bypass : "") + common;
+}
+
 async function toggleApprovalBypass() {
   const box = document.getElementById("bypassApproval");
   if (!state.current) { box.checked = false; alert("Open a session first."); return; }
+  // Turning bypass ON is the risky action — gate it behind the disclaimer (if enabled). On cancel,
+  // revert the checkbox and do nothing. Turning it back OFF (re-enabling approvals) is never gated.
+  if (box.checked && !(await showDisclaimer("bypass"))) { box.checked = false; return; }
   const mode = box.checked ? "auto" : "manual";
   try { await api(`/api/sessions/${state.current}/approval-mode`, "POST", { mode }); state.approvalMode = mode; }
   catch (e) { box.checked = !box.checked; alert(e.message); }
@@ -704,6 +766,8 @@ async function startSession() {
   const target = document.getElementById("targetInput").value.trim();
   const instructions = document.getElementById("instructionsInput").value.trim();
   if (!target) { alert("Enter a target."); return; }
+  // Risk disclaimer (hidden feature): must be acknowledged before an engagement can start.
+  if (!(await showDisclaimer("start"))) return;
   try { await api(`/api/sessions/${state.current}/start`, "POST", { target, instructions }); }
   catch (e) { alert("Start failed: " + e.message); }
 }
@@ -1327,6 +1391,8 @@ async function initAuth() {
   let st;
   try { st = await fetch("/api/auth/status").then(r => r.json()); }
   catch (e) { st = { authenticated: false, needs_setup: false }; }
+  // Hidden risk-disclaimer feature flag (SPAIDER_REQUIRE_DISCLAIMER on the server).
+  state.requireDisclaimer = !!st.disclaimer;
   if (st.authenticated && st.user) bootApp(st.user);
   else showAuthForms(st.needs_setup);
 }

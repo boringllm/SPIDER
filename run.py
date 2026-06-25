@@ -41,6 +41,14 @@ def _open_browser(url: str) -> None:
 
 
 def main() -> None:
+    # Load the repo-root .env into the environment FIRST (before the server module is imported or any
+    # env var is read), so settings like SPAIDER_REQUIRE_DISCLAIMER and the API keys can live in a
+    # .env file instead of being exported in the shell. A real shell variable still wins. Under
+    # --reload, uvicorn's worker is a child process that inherits this loaded environment.
+    from spider._env import load_env
+
+    load_env()
+
     parser = argparse.ArgumentParser(description="SPAIDER — autonomous penetration-testing web app")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)

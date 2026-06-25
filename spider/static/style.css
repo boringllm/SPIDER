@@ -4,6 +4,10 @@
   --yellow: #d29922; --red: #f85149; --purple: #bc8cff; --orange: #db6d28;
 }
 * { box-sizing: border-box; }
+/* Brand logo anchor: holds either an emoji glyph or an <img> (a PNG/SVG logo). theme.py swaps
+   the contents; the img rule keeps an image sized to the surrounding text. */
+.brand-logo { display: inline-block; line-height: 1; }
+.brand-logo img { height: 1.15em; width: auto; vertical-align: -0.2em; }
 html, body { height: 100%; }
 body {
   margin: 0; font: 13px/1.5 -apple-system, Segoe UI, Roboto, sans-serif;
@@ -282,6 +286,17 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .toolbar label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted); }
 .modal-wrap { position: fixed; inset: 0; background: #000a; display: flex; align-items: center; justify-content: center; z-index: 60; padding: 20px; }
+/* Risk/responsibility disclaimer (hidden SPAIDER_REQUIRE_DISCLAIMER feature). */
+.disclaimer-card { border-color: var(--yellow); box-shadow: 0 0 0 1px var(--yellow), 0 12px 40px #000c; }
+.disclaimer-title { color: var(--yellow) !important; margin: 0 0 10px; font-size: 18px; }
+.disclaimer-body { font-size: 12.5px; line-height: 1.55; }
+.disclaimer-body p { margin: 0 0 10px; }
+.disclaimer-body ul { margin: 0 0 10px; padding-left: 20px; }
+.disclaimer-body li { margin: 4px 0; }
+.disclaimer-body strong { color: var(--text); }
+.disclaimer-body .lead { color: var(--yellow); font-weight: 600; }
+.disclaimer-actions { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+.disclaimer-actions .danger-confirm { background: var(--yellow); border-color: var(--yellow); color: #1a1400; }
 .prompt-pre { white-space: pre-wrap; background: #0a0e14; border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-size: 11.5px; max-height: 50vh; overflow: auto; }
 
 /* ---------- responsive ---------- */

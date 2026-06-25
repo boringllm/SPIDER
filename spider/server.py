@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -231,15 +232,27 @@ class DisableBody(BaseModel):
 # --------------------------------------------------------------------------- #
 # Authentication (login / first-run setup / logout) and user management
 # --------------------------------------------------------------------------- #
+def _disclaimer_required() -> bool:
+    """HIDDEN feature flag: when the ``SPAIDER_REQUIRE_DISCLAIMER`` environment variable is set to a
+    truthy value (1/true/yes/on), the UI forces the operator to read and accept a risk/responsibility
+    disclaimer before starting an engagement or bypassing the approval gate. Off (and invisible) by
+    default; read per-request so it can be toggled without restarting. Surfaced to the client via
+    ``/api/auth/status`` (which the SPA fetches on load)."""
+    return os.environ.get("SPAIDER_REQUIRE_DISCLAIMER", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @app.get("/api/auth/status")
 async def auth_status(request: Request) -> dict:
     """Drives the UI's auth gate: whether the caller is logged in, and whether this is a
-    fresh install with no users yet (-> show the 'create administrator' screen)."""
+    fresh install with no users yet (-> show the 'create administrator' screen). Also carries the
+    hidden ``disclaimer`` flag (SPAIDER_REQUIRE_DISCLAIMER) so the SPA knows whether to gate
+    start-session / bypass-approvals behind the risk acknowledgement."""
     user = getattr(request.state, "user", None)
     return {
         "authenticated": user is not None,
         "needs_setup": await auth.needs_setup(),
         "user": user.public() if user else None,
+        "disclaimer": _disclaimer_required(),
     }
 
 

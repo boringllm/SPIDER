@@ -50,7 +50,7 @@ penetration testing.
 
 ```
 ┌───────────────────────────────────────────────┐          ┌──────────────────────────────┐
-│  SPAIDER (your host) — FastAPI + web UI        │          │  Kali container              │
+│  SPAIDER (your host) — FastAPI + web UI       │          │  Kali container              │
 │                                               │          │                              │
 │  orchestrator (pentest lead)                  │   MCP/   │  kali_server (MCP-over-HTTP) │
 │    ├─ recon          ┐                        │   HTTP   │    nmap_scan, nikto_scan,    │
@@ -344,6 +344,7 @@ Most things are configurable from the UI (**Settings**) without touching code:
 - **Tune the tool-approval policy** (which categories need sign-off) — Settings → Tool approval.
 - **Set models, keys, parameters, pricing, presets** — Settings → Models.
 - **Write methodology skills** — drop a Markdown file in [`skills/`](skills/).
+
 
 For deeper changes — adding a host or Kali tool, changing the agent loop, the report/template
 pipeline, intensity mapping, persistence, or auth — every module and the exact function to edit is

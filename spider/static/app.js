@@ -1440,5 +1440,57 @@ async function toggleUserDisabled(uid, disabled) {
   catch (e) { alert(e.message || "failed"); }
 }
 
+// ----------------------------------------------------------- agent-tree resizer
+// Let the operator drag the agent-tree column wider/narrower so nothing gets clipped when info
+// (status badge + rounds-left, deep child trees) doesn't fit. The width is stored as the
+// `--tree-w` CSS variable on the .reverse grid (which reflows the chat panel to match) and
+// persisted to localStorage. Double-click the handle to reset to the default.
+const TREE_W_KEY = "spider.treeWidth";
+const TREE_W_MIN = 160, TREE_W_MAX = 640, TREE_W_DEFAULT = 240;
+function applyTreeWidth(px) {
+  const rev = document.getElementById("reverseView"); if (!rev) return;
+  if (px == null) rev.style.removeProperty("--tree-w");
+  else rev.style.setProperty("--tree-w", Math.round(px) + "px");
+}
+function initTreeResizer() {
+  const handle = document.getElementById("treeResizer");
+  const rev = document.getElementById("reverseView");
+  if (!handle || !rev) return;
+  const saved = parseInt(localStorage.getItem(TREE_W_KEY) || "", 10);
+  if (saved >= TREE_W_MIN && saved <= TREE_W_MAX) applyTreeWidth(saved);
+
+  let dragging = false;
+  const onMove = (e) => {
+    if (!dragging) return;
+    const x = (e.touches ? e.touches[0].clientX : e.clientX) - rev.getBoundingClientRect().left;
+    const w = Math.max(TREE_W_MIN, Math.min(TREE_W_MAX, x));
+    applyTreeWidth(w);
+    e.preventDefault();
+  };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove("dragging");
+    document.body.classList.remove("col-resizing");
+    const cur = getComputedStyle(rev).getPropertyValue("--tree-w").trim();
+    const w = parseInt(cur, 10);
+    if (w) localStorage.setItem(TREE_W_KEY, String(w));
+  };
+  const onDown = (e) => {
+    dragging = true;
+    handle.classList.add("dragging");
+    document.body.classList.add("col-resizing");
+    e.preventDefault();
+  };
+  handle.addEventListener("mousedown", onDown);
+  handle.addEventListener("touchstart", onDown, { passive: false });
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("touchmove", onMove, { passive: false });
+  window.addEventListener("mouseup", onUp);
+  window.addEventListener("touchend", onUp);
+  handle.addEventListener("dblclick", () => { applyTreeWidth(null); localStorage.removeItem(TREE_W_KEY); });
+}
+
 // ----------------------------------------------------------- init
+initTreeResizer();
 initAuth();

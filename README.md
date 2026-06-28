@@ -249,10 +249,7 @@ the orchestrator (and saved in the session workspace under `uploads/` so any age
 
 When you press **Start**, SPAIDER shows a **target picker** listing the approved targets returned by
 your provider script `target_providers/targets.py` (`list_targets()`). Customise that file to source
-targets from wherever you like (a CSV/JSON, a CMDB, an internal API…). Depending on the operator's
-access role, the picker either restricts them to the listed targets (the script also sets the session
-name) or additionally lets them enter a target manually and rename the session — see
-[Access roles](#human-in-the-loop-controls).
+targets from wherever you like (a CSV/JSON, a CMDB, an internal API…).
 
 ### 5. Generate the report
 Click **📄 Report**. Optionally upload a **template** (`.pdf` / `.docx` / `.md`) or paste one — the

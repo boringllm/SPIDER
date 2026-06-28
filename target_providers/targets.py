@@ -3,12 +3,6 @@
 At the start of every engagement the "Start engagement" flow asks this module for the list of targets
 to offer the operator (``GET /api/targets`` calls ``list_targets()``).
 
-How it is used depends on the operator's access role:
-  * **limited** pentest role (no ``free_target_choice`` capability): the operator can ONLY pick a target
-    from this list; they cannot edit the target, the instructions, or the session name — the values
-    you return here are used verbatim (the session is renamed to ``session_name``).
-  * **free** pentest role (``free_target_choice``): this list is still shown as a convenience, but the
-    operator may instead enter a target manually and edit the instructions / session name.
 
 Return a list of dicts. Recognised keys (all optional except ``target``):
   - ``id``           : stable identifier (defaults to the name/target).
@@ -61,14 +55,5 @@ def list_targets() -> list[dict]:
             ),
             "session_name": "Juice Shop — training run",
         },
-        {
-            "id": "Bank",
-            "name": "Bank test application",
-            "target": "http://127.0.0.1:8881",
-            "instructions": (
-                "Training engagement against the local bank app. Full web-app "
-                "testing is authorised against this single host only."
-            ),
-            "session_name": "Bank App",
-        },
+
     ]

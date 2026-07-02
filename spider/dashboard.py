@@ -48,8 +48,6 @@ def _model_params(session) -> list[dict]:
         params = {k: v for k, v in mc.items() if k != "api_key" and not k.startswith("_")}
         out.append({"role": role, **params})
     return out
-
-
 def compute(session) -> dict[str, Any]:
     """Build the dashboard payload for one session. Everything is derived from the event log, with
     the in-memory session used only as a fallback (e.g. no log yet) and for display metadata."""

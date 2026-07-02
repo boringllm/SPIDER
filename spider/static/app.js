@@ -69,17 +69,16 @@ function renderSessions() {
   const el = document.getElementById("sessionList");
   if (!state.sessions.length) { el.innerHTML = '<div class="empty">No sessions</div>'; return; }
   const me = state.user || {};
-  const isAdmin = me.role === "admin";
   el.innerHTML = state.sessions.map(s => {
     const running = s.status === "running";
-    // For an admin, label sessions that belong to OTHER users so they can monitor (and, if needed,
-    // stop) any operator's engagement. The server already lets admins open/stop any session; this is
-    // just the visual cue for whose it is.
-    const others = isAdmin && s.owner && s.owner !== me.id;
+    // Label sessions that belong to OTHER users (an admin monitoring everyone, or a read-granted
+    // viewer) so it's clear whose engagement each one is. Only the owner (or an admin) may delete.
+    const others = s.owner && s.owner !== me.id;
+    const mayDelete = !others;  // server enforces; non-owners (readers) can't delete
     const ownerTag = others ? `<span class="sess-owner" title="owner">👤 ${esc(s.owner_name || s.owner)}</span>` : "";
     return `
     <div class="session-item ${s.id === state.current ? "active" : ""} ${others ? "other-owner" : ""}" onclick="selectSession('${s.id}')">
-      <button class="del-btn" title="Delete session" onclick="deleteSession(event,'${s.id}')">✕</button>
+      ${mayDelete ? `<button class="del-btn" title="Delete session" onclick="deleteSession(event,'${s.id}')">✕</button>` : ""}
       <div class="name">${running ? '<span class="live-dot" title="running"></span>' : ""}${esc(s.name)} ${ownerTag}</div>
       <div class="meta">${esc(s.status)} · ${esc(s.target || "no target")}</div>
     </div>`;
@@ -89,7 +88,8 @@ function renderSessions() {
 // background. Regular users only see their own sessions and don't need the extra polling.
 function startSessionPoll() {
   stopSessionPoll();
-  if (!state.user || state.user.role !== "admin") return;
+  // Admins (all sessions) and read-capable viewers (granted sessions) benefit from a live list.
+  if (!state.isAdmin && !cap("read")) return;
   state.sessionPoll = setInterval(() => { loadSessions().catch(() => {}); }, 5000);
 }
 function stopSessionPoll() { if (state.sessionPoll) { clearInterval(state.sessionPoll); state.sessionPoll = null; } }
@@ -116,7 +116,7 @@ async function selectSession(sid) {
   state.agents = {}; state.findings = {}; state.approvals = {}; state.requests = {};
   state.terminals = { __all__: [] }; state.agentTab = "chat"; state.uploads = [];
   state.rawFeeds = { __all__: [] }; state.rawStream = {};
-  state.planApprovals = {};
+  state.planApprovals = {}; state.dash = null;
   state.feeds = { __all__: [] }; state.streaming = {}; state.selectedAgent = "__all__";
   state.session = await api(`/api/sessions/${sid}`);
   state.plan = state.session.plan || { steps: [] };
@@ -148,6 +148,7 @@ async function selectSession(sid) {
   document.getElementById("sessName").textContent = state.session.name;
   document.getElementById("targetInput").value = state.session.target || "";
   document.getElementById("instructionsInput").value = state.session.instructions || "";
+  applyCapsUI();   // show/hide Start/Resume/Rename + lock manual fields per this user's capabilities
   const orch = Object.values(state.agents).find(a => a.role === "orchestrator");
   state.selectedAgent = orch ? orch.id : "__all__";
   state.showPanels = window.innerWidth >= 1100;
@@ -216,6 +217,13 @@ function handleEvent(ev) {
   switch (ev.type) {
     case "session.status":
       if (state.session) state.session.status = p.status; renderStatus(); renderSessions(); break;
+    case "session.renamed": {
+      // Live title update (e.g. an admin renamed it, or a script-driven name was applied).
+      if (state.session) state.session.name = p.name;
+      const el = document.getElementById("sessName"); if (el) el.textContent = p.name;
+      const sx = (state.sessions || []).find(x => x.id === state.current); if (sx) sx.name = p.name;
+      renderSessions(); break;
+    }
     case "plan.update": case "plan.step": state.plan = p.plan; renderPlan(); break;
     case "agent.created":
       state.agents[aid] = { id: aid, name: p.name, role: p.role, status: "running",
@@ -274,7 +282,10 @@ function handleEvent(ev) {
     case "finding.stored":
       state.findings[p.finding.id] = p.finding; renderFindings();
       pushFeed(aid, "sys", "finding", `${p.finding.title} [${p.finding.severity}/${p.finding.status}]`); break;
-    case "cost.update": state.cost = p.cost; renderCost(); if (state.selectedAgent !== "__all__") renderAgentHead(); break;
+    case "cost.update":
+      state.cost = p.cost; appendDashPoint(p.cost); renderCost();
+      if (state.view === "dashboard") renderDashboardCharts();
+      if (state.selectedAgent !== "__all__") renderAgentHead(); break;
     case "context.compacted":
       pushFeed(aid, "sys", "compaction", `context compacted (summary ${p.summary_chars} chars)`); break;
     case "approval.request":
@@ -322,6 +333,7 @@ function renderAll() { renderStatus(); renderTree(); renderAgentHead(); renderAc
 function renderStatus() {
   const s = state.session ? state.session.status : "created";
   const el = document.getElementById("sessStatus"); el.textContent = s; el.className = "badge " + s;
+  applyCapsUI();   // keep the Start button greyed/un-greyed as the session starts/stops
 }
 function setView(v) {
   state.view = v;
@@ -329,7 +341,7 @@ function setView(v) {
   document.getElementById("dashboardView").classList.toggle("hidden", v !== "dashboard");
   document.getElementById("viewReverseBtn").classList.toggle("active", v === "reverse");
   document.getElementById("viewDashBtn").classList.toggle("active", v === "dashboard");
-  if (v === "dashboard") renderCost(); else renderActiveAgentView();
+  if (v === "dashboard") loadDashboard(); else renderActiveAgentView();
 }
 function toggleSub(name) {
   const el = document.getElementById("subwin-" + name);
@@ -522,25 +534,258 @@ function renderFindings() {
       <div class="sub">${esc(f.severity)} · ${esc(f.status)} · ${esc((f.data && f.data.location) || "")}</div>
       <div class="muted" style="font-size:11px">${esc(truncate((f.data && f.data.description) || "", 200))}</div></div>`).join("");
 }
-// ----------------------------------------------------------- dashboard cost
+// ----------------------------------------------------------- dashboard analytics
+// Fetch the static (no-LLM) analytics for this session (cost/token time series + breakdowns, from
+// the event log) and render the grid, charts and tables. Called when the Dashboard view is opened.
+async function loadDashboard() {
+  renderCost();                              // paint whatever we already have immediately
+  if (!state.current) return;
+  try { state.dash = await api(`/api/sessions/${state.current}/dashboard`); }
+  catch (e) { /* keep any prior data */ }
+  renderCost(); renderDashboardCharts();
+}
+// Number / money / duration formatting shared by the live dashboard AND the exported report.
+function fmtUsd(v) { v = +v || 0; return "$" + (v >= 1 ? v.toFixed(2) : v.toFixed(4)); }
+function fmtNum(v) { v = +v || 0; return v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "k" : String(Math.round(v)); }
+function fmtDur(s) { s = Math.round(+s || 0); if (s < 60) return s + "s"; const m = Math.floor(s / 60), ss = s % 60; if (m < 60) return m + "m " + ss + "s"; const h = Math.floor(m / 60); return h + "h " + (m % 60) + "m"; }
+
 function renderCost() {
-  const c = state.cost; const grid = document.getElementById("costGrid"); if (!grid) return;
-  if (!c) { grid.innerHTML = '<span class="muted">No usage yet.</span>'; return; }
-  grid.innerHTML = `
-    <div class="cost-stat"><div class="v">$${(c.total_usd || 0).toFixed(4)}</div><div class="l">total cost</div></div>
-    <div class="cost-stat"><div class="v">${c.input_tokens || 0}</div><div class="l">input tokens</div></div>
-    <div class="cost-stat"><div class="v">${c.output_tokens || 0}</div><div class="l">output tokens</div></div>
-    <div class="cost-stat"><div class="v">${c.cache_read || 0}</div><div class="l">cache read</div></div>
-    <div class="cost-stat"><div class="v">${c.cache_write || 0}</div><div class="l">cache write</div></div>
-    <div class="cost-stat"><div class="v">${Object.keys(c.by_agent || {}).length}</div><div class="l">agents</div></div>`;
+  const grid = document.getElementById("costGrid"); if (!grid) return;
+  const d = state.dash;
+  const t = d ? d.totals : (state.cost ? {
+    total_usd: state.cost.total_usd || 0, input_tokens: state.cost.input_tokens || 0,
+    output_tokens: state.cost.output_tokens || 0, cache_read: state.cost.cache_read || 0,
+    cache_write: state.cost.cache_write || 0, agents: Object.keys(state.cost.by_agent || {}).length,
+    findings: Object.keys(state.findings || {}).length, tool_calls: 0, llm_calls: 0, duration_s: 0,
+  } : null);
+  if (!t) { grid.innerHTML = '<span class="muted">No usage yet.</span>'; }
+  else {
+    const stat = (v, l) => `<div class="cost-stat"><div class="v">${v}</div><div class="l">${l}</div></div>`;
+    grid.innerHTML = stat(fmtUsd(t.total_usd), "total cost") + stat(fmtNum(t.input_tokens), "input tokens") +
+      stat(fmtNum(t.output_tokens), "output tokens") + stat(fmtNum(t.cache_read), "cache read") +
+      stat(fmtNum(t.cache_write), "cache write") + stat(t.agents || 0, "agents") +
+      stat(t.findings || 0, "findings") + stat(t.tool_calls || 0, "tool calls") +
+      stat(t.llm_calls || 0, "LLM calls") + stat(fmtDur(t.duration_s), "duration");
+  }
+  const agents = d ? d.by_agent : Object.values((state.cost || {}).by_agent || {});
   const at = document.getElementById("costByAgent");
-  const arows = Object.entries(c.by_agent || {}).map(([id, v]) =>
-    `<tr><td>${esc(v.name)}</td><td>${esc(v.role)}</td><td>${esc(v.model)}</td><td>${v.input}</td><td>${v.output}</td><td>$${v.usd.toFixed(4)}</td></tr>`).join("");
+  const arows = (agents || []).map(v =>
+    `<tr><td>${esc(v.name)}</td><td>${esc(v.role)}</td><td>${esc(v.model)}</td><td>${fmtNum(v.input)}</td><td>${fmtNum(v.output)}</td><td>${fmtUsd(v.usd)}</td></tr>`).join("");
   if (at) at.innerHTML = arows ? `<tr><th>agent</th><th>role</th><th>model</th><th>input</th><th>output</th><th>cost</th></tr>${arows}` : '<tr><td class="muted">No per-agent usage yet.</td></tr>';
+  const models = d ? d.by_model : Object.entries((state.cost || {}).by_model || {}).map(([m, v]) => ({ model: m, ...v }));
   const mt = document.getElementById("costByModel");
-  const mrows = Object.entries(c.by_model || {}).map(([m, v]) =>
-    `<tr><td>${esc(m)}</td><td>${v.input} in</td><td>${v.output} out</td><td>$${v.usd.toFixed(4)}</td></tr>`).join("");
+  const mrows = (models || []).map(v =>
+    `<tr><td>${esc(v.model)}</td><td>${fmtNum(v.input)} in</td><td>${fmtNum(v.output)} out</td><td>${fmtUsd(v.usd)}</td></tr>`).join("");
   if (mt) mt.innerHTML = mrows ? `<tr><th>model</th><th></th><th></th><th>cost</th></tr>${mrows}` : '<tr><td class="muted">—</td></tr>';
+}
+
+// Keep the dashboard live: fold each incoming cost.update snapshot into state.dash (append a series
+// point, refresh totals + breakdowns) so charts/grid update without re-fetching the whole log.
+function appendDashPoint(c) {
+  if (!state.dash || !c) return;
+  const now = Date.now() / 1000;
+  const s = state.dash.series = state.dash.series || [];
+  const t0 = s.length ? s[0].t : now;
+  s.push({
+    t: now, elapsed_s: +(now - t0).toFixed(3),
+    total_usd: c.total_usd || 0, input_tokens: c.input_tokens || 0, output_tokens: c.output_tokens || 0,
+    cache_read: c.cache_read || 0, cache_write: c.cache_write || 0,
+  });
+  const T = state.dash.totals;
+  T.total_usd = c.total_usd || 0; T.input_tokens = c.input_tokens || 0; T.output_tokens = c.output_tokens || 0;
+  T.cache_read = c.cache_read || 0; T.cache_write = c.cache_write || 0; T.llm_calls = s.length;
+  state.dash.by_agent = Object.values(c.by_agent || {})
+    .map(v => ({ name: v.name, role: v.role, model: v.model, usd: v.usd, input: v.input, output: v.output }))
+    .sort((a, b) => b.usd - a.usd);
+  state.dash.by_model = Object.entries(c.by_model || {})
+    .map(([m, v]) => ({ model: m, usd: v.usd, input: v.input, output: v.output })).sort((a, b) => b.usd - a.usd);
+}
+
+// ---- dependency-free SVG chart toolkit (used by the dashboard AND the exported HTML report) ----
+// Colors are explicit hex so the same SVG renders correctly both in the dark app and in the
+// light-themed standalone report; axis text uses a mid-grey readable on either background.
+const CHART_PALETTE = ["#4aa3ff", "#41d19b", "#b083f0", "#ffb454", "#ff6b6b", "#5bd1d7", "#f7c948", "#e57ccd", "#7dd87d", "#ff9f68"];
+const SEV_COLORS = { critical: "#e5484d", high: "#ff8c42", medium: "#f7c948", low: "#4aa3ff", info: "#8b95a5", other: "#6b7280" };
+const TOK_COLORS = { input_tokens: "#4aa3ff", output_tokens: "#41d19b", cache_read: "#b083f0", cache_write: "#ffb454" };
+const AXIS_C = "#8b95a5", GRID_C = "rgba(136,136,136,.22)";
+function svgWrap(w, h, inner) { return `<svg viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,-apple-system,sans-serif" font-size="16">${inner}</svg>`; }
+function svgEmpty(w, h, msg) { return svgWrap(w, h, `<text x="${w / 2}" y="${h / 2}" text-anchor="middle" fill="${AXIS_C}">${esc(msg)}</text>`); }
+// Multi-series line chart over the elapsed-time x axis. `lines` = [{key,color,label}].
+function svgLine(series, lines, yFmt) {
+  const w = 560, h = 244, pl = 74, pr = 132, pt = 20, pb = 40;
+  if (!series || !series.length) return svgEmpty(w, h, "no data yet");
+  const xs = series.map(p => p.elapsed_s || 0);
+  const xmin = Math.min(...xs, 0), xmax = Math.max(...xs, 1e-9);
+  let ymax = 0; lines.forEach(L => series.forEach(p => { ymax = Math.max(ymax, +p[L.key] || 0); }));
+  ymax = ymax || 1;
+  const X = x => pl + (xmax === xmin ? 0 : (x - xmin) / (xmax - xmin)) * (w - pl - pr);
+  const Y = y => (h - pb) - (y / ymax) * (h - pt - pb);
+  let g = "";
+  for (let i = 0; i <= 4; i++) {
+    const yy = pt + (h - pt - pb) * i / 4, val = ymax * (1 - i / 4);
+    g += `<line x1="${pl}" y1="${yy.toFixed(1)}" x2="${w - pr}" y2="${yy.toFixed(1)}" stroke="${GRID_C}"/>`;
+    g += `<text x="${pl - 8}" y="${(yy + 5).toFixed(1)}" text-anchor="end" fill="${AXIS_C}">${(yFmt || fmtNum)(val)}</text>`;
+  }
+  g += `<text x="${pl}" y="${h - 10}" fill="${AXIS_C}">0s</text>`;
+  g += `<text x="${w - pr}" y="${h - 10}" text-anchor="end" fill="${AXIS_C}">${fmtDur(xmax)}</text>`;
+  lines.forEach((L, li) => {
+    const d = series.map((p, i) => (i ? "L" : "M") + X(p.elapsed_s || 0).toFixed(1) + " " + Y(+p[L.key] || 0).toFixed(1)).join(" ");
+    g += `<path d="${d}" fill="none" stroke="${L.color}" stroke-width="2.5"/>`;
+    if (series.length === 1) g += `<circle cx="${X(xs[0]).toFixed(1)}" cy="${Y(+series[0][L.key] || 0).toFixed(1)}" r="4" fill="${L.color}"/>`;
+    const ly = pt + li * 24;
+    g += `<rect x="${w - pr + 10}" y="${ly}" width="14" height="14" rx="3" fill="${L.color}"/>`;
+    g += `<text x="${w - pr + 30}" y="${ly + 12}" fill="${AXIS_C}">${esc(L.label)}</text>`;
+  });
+  return svgWrap(w, h, g);
+}
+// Donut chart. `parts` = [{label,value,color}].
+function svgDonut(parts) {
+  const w = 560, h = 232, cx = 116, cy = 116, r = 88, ir = 52;
+  const total = parts.reduce((s, p) => s + (+p.value || 0), 0);
+  if (!total) return svgEmpty(w, h, "no data yet");
+  let a = -Math.PI / 2, g = "";
+  parts.forEach(p => {
+    const frac = (+p.value || 0) / total; if (frac <= 0) return;
+    const a2 = a + frac * 2 * Math.PI, large = frac > 0.5 ? 1 : 0;
+    const P = (rad, ang) => `${(cx + rad * Math.cos(ang)).toFixed(1)} ${(cy + rad * Math.sin(ang)).toFixed(1)}`;
+    g += `<path d="M${P(r, a)} A${r} ${r} 0 ${large} 1 ${P(r, a2)} L${P(ir, a2)} A${ir} ${ir} 0 ${large} 0 ${P(ir, a)} Z" fill="${p.color}"/>`;
+    a = a2;
+  });
+  parts.forEach((p, i) => {
+    const ly = 30 + i * 30, pct = total ? (+p.value || 0) / total * 100 : 0;
+    g += `<rect x="256" y="${ly}" width="15" height="15" rx="3" fill="${p.color}"/>`;
+    g += `<text x="278" y="${ly + 13}" fill="${AXIS_C}">${esc(p.label)} — ${fmtNum(p.value)} (${pct.toFixed(0)}%)</text>`;
+  });
+  return svgWrap(w, h, g);
+}
+// Horizontal bar chart. `items` = [{label,value,color?}].
+function svgBars(items, valFmt) {
+  const w = 560, rowH = 34, pad = 14, labelW = 178;
+  if (!items || !items.length) return svgEmpty(w, 120, "no data yet");
+  const h = Math.max(82, pad * 2 + items.length * rowH), max = Math.max(...items.map(i => +i.value || 0), 1e-9), barW = w - labelW - 98;
+  let g = "";
+  items.forEach((it, i) => {
+    const y = pad + i * rowH, bw = Math.max(1, (+it.value || 0) / max * barW), col = it.color || CHART_PALETTE[i % CHART_PALETTE.length];
+    g += `<text x="${labelW - 8}" y="${y + 21}" text-anchor="end" fill="${AXIS_C}">${esc(truncate(String(it.label), 20))}</text>`;
+    g += `<rect x="${labelW}" y="${y + 6}" width="${bw.toFixed(1)}" height="20" rx="4" fill="${col}"/>`;
+    g += `<text x="${(labelW + bw + 8).toFixed(1)}" y="${y + 22}" fill="${AXIS_C}">${(valFmt || fmtNum)(it.value)}</text>`;
+  });
+  return svgWrap(w, h, g);
+}
+// Build the set of chart cards (returned as [title, svg, subtitle] tuples) so both the live
+// dashboard and the exported report render exactly the same graphs from the same data.
+function dashboardCharts(d) {
+  const s = d.series || [], T = d.totals || {};
+  const tokMix = [
+    { label: "input", value: T.input_tokens, color: TOK_COLORS.input_tokens },
+    { label: "output", value: T.output_tokens, color: TOK_COLORS.output_tokens },
+    { label: "cache read", value: T.cache_read, color: TOK_COLORS.cache_read },
+    { label: "cache write", value: T.cache_write, color: TOK_COLORS.cache_write },
+  ];
+  const agentBars = (d.by_agent || []).slice(0, 10).map((a, i) => ({ label: a.name || a.role, value: a.usd, color: CHART_PALETTE[i % CHART_PALETTE.length] }));
+  const modelBars = (d.by_model || []).map((m, i) => ({ label: m.model, value: m.usd, color: CHART_PALETTE[i % CHART_PALETTE.length] }));
+  const sev = d.findings_by_severity || {};
+  const sevBars = ["critical", "high", "medium", "low", "info", "other"].filter(k => sev[k]).map(k => ({ label: k, value: sev[k], color: SEV_COLORS[k] }));
+  const toolBars = (d.tools || []).slice(0, 10).map((tl, i) => ({ label: tl.tool, value: tl.count, color: CHART_PALETTE[i % CHART_PALETTE.length] }));
+  return [
+    ["Cost over time", svgLine(s, [{ key: "total_usd", color: "#41d19b", label: "cost" }], fmtUsd), "cumulative USD as the engagement progresses"],
+    ["Tokens over time", svgLine(s, [
+      { key: "input_tokens", color: TOK_COLORS.input_tokens, label: "input" },
+      { key: "output_tokens", color: TOK_COLORS.output_tokens, label: "output" },
+      { key: "cache_read", color: TOK_COLORS.cache_read, label: "cache read" }], fmtNum), "cumulative token usage"],
+    ["Token mix", svgDonut(tokMix), "share of tokens by bucket"],
+    ["Cost per agent", svgBars(agentBars, fmtUsd), "top spenders"],
+    ["Cost per model", svgBars(modelBars, fmtUsd), ""],
+    ["Findings by severity", svgBars(sevBars, fmtNum), ""],
+    ["Top tools by calls", svgBars(toolBars, fmtNum), "most-invoked tools"],
+  ];
+}
+function renderDashboardCharts() {
+  const box = document.getElementById("dashCharts"); if (!box) return;
+  if (!state.dash) { box.innerHTML = ""; return; }
+  box.innerHTML = dashboardCharts(state.dash).map(([title, svg, sub]) =>
+    `<div class="card chart-card"><h3>${esc(title)}</h3>${sub ? `<div class="chart-sub muted">${esc(sub)}</div>` : ""}<div class="chart-wrap">${svg}</div></div>`).join("");
+}
+
+// ---- static (no-LLM) report export: a readable HTML report + a CSV/JSON data bundle ----
+async function exportDashboardReport() {
+  const st = document.getElementById("dashExportStatus");
+  if (!state.current) { alert("Open a session first."); return; }
+  if (st) { st.style.color = "var(--muted)"; st.textContent = "building…"; }
+  if (!state.dash) await loadDashboard();
+  const d = state.dash;
+  if (!d) { if (st) { st.style.color = "var(--red)"; st.textContent = "no data to export"; } return; }
+  const base = `spaider-dashboard-${String((state.session && state.session.name) || "session").replace(/[^\w.-]+/g, "_")}`;
+  downloadBlob(base + ".html", "text/html;charset=utf-8", buildDashboardHTML(d));
+  downloadBlob(base + ".json", "application/json;charset=utf-8", JSON.stringify(d, null, 2));
+  downloadBlob(base + ".csv", "text/csv;charset=utf-8", buildDashboardCSV(d));
+  if (st) { st.style.color = "var(--green)"; st.textContent = "✓ exported HTML + CSV + JSON (see your downloads)"; setTimeout(() => st.textContent = "", 6000); }
+}
+function downloadBlob(name, type, content) {
+  const b = new Blob([content], { type });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(b); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+// Tidy time-series CSV for the data-science team (one row per LLM turn); the JSON carries the rest.
+function buildDashboardCSV(d) {
+  const rows = [["t_epoch", "elapsed_s", "total_usd", "input_tokens", "output_tokens", "cache_read", "cache_write"]];
+  (d.series || []).forEach(p => rows.push([p.t, p.elapsed_s, p.total_usd, p.input_tokens, p.output_tokens, p.cache_read, p.cache_write]));
+  return rows.map(r => r.join(",")).join("\n");
+}
+// A self-contained, print-friendly HTML report (embeds the same SVG charts + all the tables) so a
+// non-technical reader can review the engagement at a glance. No external assets, no scripts.
+function buildDashboardHTML(d) {
+  const t = d.totals || {}, se = d.session || {};
+  const stat = (l, v) => `<div class="stat"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`;
+  const stats = [
+    ["total cost", fmtUsd(t.total_usd)], ["duration", fmtDur(t.duration_s)], ["LLM calls", fmtNum(t.llm_calls)],
+    ["agents", t.agents || 0], ["findings", t.findings || 0], ["tool calls", fmtNum(t.tool_calls)],
+    ["input tokens", fmtNum(t.input_tokens)], ["output tokens", fmtNum(t.output_tokens)],
+    ["cache read", fmtNum(t.cache_read)], ["cache write", fmtNum(t.cache_write)],
+  ].map(([l, v]) => stat(l, v)).join("");
+  const charts = dashboardCharts(d).map(([title, svg, sub]) =>
+    `<section class="chart-card"><h2>${esc(title)}</h2>${sub ? `<p class="sub">${esc(sub)}</p>` : ""}<div class="chart">${svg}</div></section>`).join("");
+  const agentRows = (d.by_agent || []).map(a => `<tr><td>${esc(a.name)}</td><td>${esc(a.role)}</td><td>${esc(a.model)}</td><td>${fmtNum(a.input)}</td><td>${fmtNum(a.output)}</td><td>${fmtUsd(a.usd)}</td></tr>`).join("") || '<tr><td colspan="6">—</td></tr>';
+  const modelRows = (d.by_model || []).map(m => `<tr><td>${esc(m.model)}</td><td>${fmtNum(m.input)}</td><td>${fmtNum(m.output)}</td><td>${fmtUsd(m.usd)}</td></tr>`).join("") || '<tr><td colspan="4">—</td></tr>';
+  const sev = d.findings_by_severity || {};
+  const sevRows = ["critical", "high", "medium", "low", "info", "other"].filter(k => sev[k]).map(k => `<tr><td><span class="dot" style="background:${SEV_COLORS[k]}"></span>${esc(k)}</td><td>${sev[k]}</td></tr>`).join("") || '<tr><td colspan="2">no findings</td></tr>';
+  const toolRows = (d.tools || []).slice(0, 20).map(tl => `<tr><td>${esc(tl.tool)}</td><td>${tl.count}</td></tr>`).join("") || '<tr><td colspan="2">—</td></tr>';
+  const css = `
+    :root{color-scheme:light}
+    *{box-sizing:border-box} body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;color:#1b2330;background:#f4f6fa}
+    .page{max-width:940px;margin:0 auto;padding:28px}
+    header h1{margin:0 0 4px;font-size:22px} header .meta{color:#5a6474;font-size:13px}
+    .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:20px 0}
+    .stat{background:#fff;border:1px solid #e2e7ef;border-radius:10px;padding:14px}
+    .stat .v{font-size:23px;font-weight:700;color:#0e6ba8} .stat .l{font-size:12.5px;color:#6b7688;text-transform:uppercase;letter-spacing:.4px;margin-top:3px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .chart-card,.tbl{background:#fff;border:1px solid #e2e7ef;border-radius:10px;padding:14px;margin:0 0 16px}
+    .chart-card h2,.tbl h2{margin:0 0 6px;font-size:16px} .sub{margin:0 0 8px;color:#6b7688;font-size:13px}
+    table{width:100%;border-collapse:collapse;font-size:14px} th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #eef1f6}
+    th{color:#6b7688;font-weight:600;text-transform:uppercase;font-size:12px;letter-spacing:.4px}
+    .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:middle}
+    footer{color:#8a93a3;font-size:11px;margin-top:18px;text-align:center}
+    @media print{body{background:#fff}.chart-card,.tbl,.stat{break-inside:avoid}}
+    @media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}}`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SPAIDER dashboard — ${esc(se.name || se.id || "session")}</title><style>${css}</style></head>
+<body><div class="page">
+  <header>
+    <h1>🕷 SPAIDER engagement dashboard</h1>
+    <div class="meta"><b>${esc(se.name || "(unnamed)")}</b> · target: ${esc(se.target || "—")} · status: ${esc(se.status || "—")} · generated ${esc(d.generated_at || "")}</div>
+  </header>
+  <div class="stats">${stats}</div>
+  <div class="grid">${charts}</div>
+  <div class="tbl"><h2>Cost per agent</h2><table><tr><th>agent</th><th>role</th><th>model</th><th>input</th><th>output</th><th>cost</th></tr>${agentRows}</table></div>
+  <div class="grid">
+    <div class="tbl"><h2>Cost per model</h2><table><tr><th>model</th><th>input</th><th>output</th><th>cost</th></tr>${modelRows}</table></div>
+    <div class="tbl"><h2>Findings by severity</h2><table><tr><th>severity</th><th>count</th></tr>${sevRows}</table></div>
+  </div>
+  <div class="tbl"><h2>Tool usage</h2><table><tr><th>tool</th><th>calls</th></tr>${toolRows}</table></div>
+  <footer>Generated statically by SPAIDER (no LLM) from the session event log. Figures reflect recorded usage; independently verify before acting on findings.</footer>
+</div></body></html>`;
 }
 
 // ----------------------------------------------------------- approvals
@@ -549,11 +794,27 @@ function renderApprovals() {
   const list = Object.values(state.approvals);
   if (!list.length) { el.innerHTML = ""; return; }
   el.innerHTML = `<div class="approvals"><b>⚠ ${list.length} command(s) awaiting approval</b>` +
-    list.map(a => `<div class="approval">
-        <span><b>${esc(a.agent_name)}</b> → <code>${esc(a.tool)}</code> ${esc(truncate(JSON.stringify(a.input), 140))}</span>
-        <span><button class="small primary" onclick="resolveApproval('${a.id}', true)">Approve</button>
-        <button class="small danger" onclick="resolveApproval('${a.id}', false)">Deny</button></span>
+    list.map(a => `<div class="cmd-approval">
+        <div class="cmd-approval-head"><b>${esc(a.agent_name)}</b> → <code>${esc(a.tool)}</code></div>
+        ${approvalInputHtml(a.input)}
+        <div class="cmd-approval-actions">
+          <button class="small primary" onclick="resolveApproval('${a.id}', true)">Approve</button>
+          <button class="small danger" onclick="resolveApproval('${a.id}', false)">Deny</button>
+        </div>
       </div>`).join("") + "</div>";
+}
+// Render the FULL command/input the agent wants to run (no truncation — the operator must see exactly
+// what will execute). The primary command string is shown prominently; any remaining args follow.
+function approvalInputHtml(input) {
+  input = input || {};
+  const cmd = input.command || input.cmd || input.code;
+  if (cmd != null && typeof cmd !== "object") {
+    const rest = { ...input }; delete rest.command; delete rest.cmd; delete rest.code;
+    const extra = Object.keys(rest).length
+      ? `<pre class="cmd-approval-args" title="other arguments">${esc(JSON.stringify(rest, null, 2))}</pre>` : "";
+    return `<pre class="cmd-approval-cmd">${esc(String(cmd))}</pre>${extra}`;
+  }
+  return `<pre class="cmd-approval-cmd">${esc(JSON.stringify(input, null, 2))}</pre>`;
 }
 
 // Raise the operator's attention when an agent asks a question / needs input: a flashing title,
@@ -762,14 +1023,124 @@ async function toggleApprovalBypass() {
 }
 
 // ----------------------------------------------------------- controls
+async function renameSession() {
+  if (!state.current) return;
+  const cur = (state.session && state.session.name) || "";
+  const name = prompt("Rename session:", cur);
+  if (name == null) return;                 // cancelled
+  const n = name.trim();
+  if (!n || n === cur) return;
+  try {
+    await api(`/api/sessions/${state.current}/rename`, "POST", { name: n });
+    if (state.session) state.session.name = n;
+    document.getElementById("sessName").textContent = n;
+    const s = (state.sessions || []).find(x => x.id === state.current); if (s) s.name = n;
+    renderSessions();
+  } catch (e) { alert(e.message || "rename failed"); }
+}
+
 async function startSession() {
-  const target = document.getElementById("targetInput").value.trim();
-  const instructions = document.getElementById("instructionsInput").value.trim();
-  if (!target) { alert("Enter a target."); return; }
+  let target = document.getElementById("targetInput").value.trim();
+  let instructions = document.getElementById("instructionsInput").value.trim();
+  let sessionName = "";
   // Risk disclaimer (hidden feature): must be acknowledged before an engagement can start.
   if (!(await showDisclaimer("start"))) return;
-  try { await api(`/api/sessions/${state.current}/start`, "POST", { target, instructions }); }
+  // Hidden target-picker feature: after the disclaimer, choose the target from the approved list.
+  // LIMITED operators (no free_target_choice) must pick from the list and cannot edit target/instructions/
+  // name; FREE operators may instead enter their own and rename the session.
+  if (state.targetPicker) {
+    const pick = await showTargetPicker();
+    if (!pick) return;                      // cancelled
+    target = pick.target;
+    instructions = pick.instructions || "";
+    sessionName = pick.session_name || "";  // applied server-side by /start (works for limited ops too)
+  }
+  if (!target) { alert("Enter or select a target."); return; }
+  try {
+    // The server applies `name` itself, so a limited operator (no edit_session) still gets the
+    // script's name. Reflect everything back into the session UI so the details aren't left blank.
+    const r = await api(`/api/sessions/${state.current}/start`, "POST", { target, instructions, name: sessionName });
+    applyStartedSession(r, target, instructions);
+  }
   catch (e) { alert("Start failed: " + e.message); }
+}
+// Push the started session's target / instructions / name into the on-screen fields, the session
+// header, and the sidebar list (the start endpoint returns the updated session dict).
+function applyStartedSession(r, target, instructions) {
+  const t = (r && r.target) || target || "";
+  const ins = (r && r.instructions != null) ? r.instructions : (instructions || "");
+  const nm = (r && r.name) || (state.session && state.session.name) || "";
+  const ti = document.getElementById("targetInput"); if (ti) ti.value = t;
+  const ii = document.getElementById("instructionsInput"); if (ii) ii.value = ins;
+  if (state.session) { state.session.target = t; state.session.instructions = ins; state.session.name = nm; if (r && r.status) state.session.status = r.status; }
+  const sn = document.getElementById("sessName"); if (sn) sn.textContent = nm;
+  const sx = (state.sessions || []).find(x => x.id === state.current);
+  if (sx) { sx.target = t; sx.name = nm; if (r && r.status) sx.status = r.status; }
+  renderSessions();
+}
+
+// ---- target picker (always shown at engagement start) ----
+// Resolves to {target, instructions, session_name} or null (cancelled). The target list comes from
+// the operator's provider script (GET /api/targets). LIMITED operators (no free_target_choice) may only
+// pick from the list; FREE operators also get a manual-entry option.
+let _targetResolve = null;
+let _targets = [];
+let _targetFree = false;
+let _targetSel = null;
+async function showTargetPicker() {
+  let data;
+  try { data = await api("/api/targets"); }
+  catch (e) { alert(e.message || "could not load targets"); return null; }
+  if (!data.enabled) {  // feature off — fall back to whatever is in the manual fields
+    return { target: document.getElementById("targetInput").value.trim(),
+             instructions: document.getElementById("instructionsInput").value.trim(), session_name: "" };
+  }
+  _targets = data.targets || [];
+  _targetFree = !!data.free;
+  _targetSel = null;
+  renderTargetPicker(data.error);
+  document.getElementById("targetModal").classList.remove("hidden");
+  return new Promise(res => { _targetResolve = res; });
+}
+function renderTargetPicker(error) {
+  document.getElementById("targetPickStatus").textContent = error
+    ? ("⚠ " + error)
+    : (_targetFree ? "Pick an approved target, or enter your own." : "Choose one of the approved targets.");
+  let html = _targets.map(t => `
+    <label class="target-opt"><input type="radio" name="tgt" onchange="selectTarget('${esc(t.id)}')">
+      <span class="target-meta"><b>${esc(t.name)}</b> <span class="muted">${esc(t.target)}</span>
+      ${t.instructions ? `<div class="muted target-instr">${esc(truncate(t.instructions, 180))}</div>` : ""}</span></label>`).join("");
+  if (_targetFree) {
+    html += `<label class="target-opt"><input type="radio" name="tgt" onchange="selectTarget('__manual__')">
+      <span class="target-meta"><b>✏️ Enter a target manually</b></span></label>`;
+  }
+  document.getElementById("targetList").innerHTML = html || '<div class="empty">No targets available.</div>';
+  document.getElementById("targetManual").classList.add("hidden");
+}
+function selectTarget(id) {
+  _targetSel = id;
+  document.getElementById("targetManual").classList.toggle("hidden", id !== "__manual__");
+}
+function confirmTargetPick() {
+  if (!_targetSel) { alert("Select a target."); return; }
+  if (_targetSel === "__manual__") {
+    const target = document.getElementById("manualTarget").value.trim();
+    if (!target) { alert("Enter a target."); return; }
+    resolveTargetPicker({
+      target,
+      instructions: document.getElementById("manualInstr").value.trim(),
+      session_name: document.getElementById("manualName").value.trim(),
+    });
+    return;
+  }
+  const t = _targets.find(x => x.id === _targetSel);
+  if (!t) { alert("Select a target."); return; }
+  resolveTargetPicker({ target: t.target, instructions: t.instructions, session_name: t.session_name });
+}
+function resolveTargetPicker(val) {
+  document.getElementById("targetModal").classList.add("hidden");
+  const r = _targetResolve; _targetResolve = null;
+  if (r) r(val);
 }
 
 // ---- reference documents (md / txt / pdf / docx) attached to the engagement ----
@@ -902,6 +1273,11 @@ function closeSettings() { document.getElementById("configOverlay").classList.ad
 function setSettingsTab(name) {
   document.querySelectorAll(".settings-tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".settings-page").forEach(p => p.classList.toggle("hidden", p.dataset.page !== name));
+  // Refresh data that other tabs may have changed, so switching tabs always shows current state.
+  // In particular the Access tab's grant dropdowns are built from the user + session lists, so a user
+  // just created on the Users tab must show up here without having to close and reopen Settings.
+  if (name === "users") loadUsers();
+  else if (name === "access") loadUsers().then(() => loadSessions()).then(renderAccess).catch(() => renderAccess());
 }
 async function loadConfig() {
   state.config = await api("/api/config");
@@ -910,6 +1286,7 @@ async function loadConfig() {
   renderConfig();
   await loadRoles(); await loadAgentDefs(); await loadTools();
   await loadUsers();     // admin-only Users tab (Settings is admin-only anyway)
+  renderAccess();        // access roles + grants (uses state.config + state.users)
 }
 
 // ---- model parameter presets ----
@@ -1369,6 +1746,7 @@ async function saveConfig() {
   document.querySelectorAll("[data-cat]").forEach(s => { pol.by_category[s.dataset.cat] = s.value; });
   gatherModels();  // sync per-agent model inputs (skills already tracked in state.config.agent_skills)
   gatherPricing();
+  gatherAccessRoles();   // sync the access-role capability checkboxes into c.user_roles
   // Reject non-ASCII in header-bound fields (a common copy-paste artifact, e.g. the '•' mask).
   for (const [role, m] of Object.entries(c.models)) {
     for (const f of ["api_key", "base_url"]) {
@@ -1387,14 +1765,25 @@ async function saveConfig() {
 }
 
 // ----------------------------------------------------------- auth gate
+// The caller's access capabilities + hidden feature flags, surfaced by /api/auth/status.
+function applyAuthMeta(st) {
+  state.requireDisclaimer = !!st.disclaimer;   // hidden SPAIDER_REQUIRE_DISCLAIMER
+  state.targetPicker = !!st.target_picker;     // target picker is always on now
+  state.separatePentest = !!st.separate_pentest; // hidden: keep launch/free target rights distinct
+  state.caps = st.caps || {};                  // access capabilities for this user
+  state.isAdmin = !!st.is_admin;
+}
+function cap(name) { return state.isAdmin || !!(state.caps && state.caps[name]); }
 async function initAuth() {
   let st;
   try { st = await fetch("/api/auth/status").then(r => r.json()); }
   catch (e) { st = { authenticated: false, needs_setup: false }; }
-  // Hidden risk-disclaimer feature flag (SPAIDER_REQUIRE_DISCLAIMER on the server).
-  state.requireDisclaimer = !!st.disclaimer;
+  applyAuthMeta(st);
   if (st.authenticated && st.user) bootApp(st.user);
   else showAuthForms(st.needs_setup);
+}
+async function refreshAuthMeta() {
+  try { applyAuthMeta(await fetch("/api/auth/status").then(r => r.json())); } catch (e) { /* keep prior */ }
 }
 function showAuthForms(needsSetup) {
   document.getElementById("authOverlay").classList.remove("hidden");
@@ -1418,11 +1807,42 @@ function bootApp(user) {
 }
 function applyUserUI(user) {
   document.getElementById("userLabel").textContent = `${user.username} · ${user.role}`;
-  // Global Settings (config + user management) is admin-only. The server enforces this; the
-  // UI simply hides the entry points for regular users.
-  const isAdmin = user.role === "admin";
+  // Global Settings (config + user management + access roles) is admin-only. The server enforces
+  // this; the UI simply hides the entry points for everyone else.
+  const isAdmin = state.isAdmin;
   const sa = document.getElementById("settingsAction"); if (sa) sa.style.display = isAdmin ? "" : "none";
-  const ut = document.querySelector('.settings-tabs [data-tab="users"]'); if (ut) ut.style.display = isAdmin ? "" : "none";
+  document.querySelectorAll('.settings-tabs [data-tab="users"], .settings-tabs [data-tab="access"]')
+    .forEach(t => { t.style.display = isAdmin ? "" : "none"; });
+  applyCapsUI();
+}
+// Show/hide per-session controls according to the caller's capabilities + the hidden target picker.
+function applyCapsUI() {
+  const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? "" : "none"; };
+  // No pentest right → no way to create or run engagements (the server enforces this too).
+  show("newSessionAction", cap("launch_pentest"));
+  show("startBtn", cap("launch_pentest"));
+  show("resumeBtn", cap("launch_pentest"));
+  show("renameBtn", cap("edit_session"));
+  // Start only applies to a brand-NEW session. Once it has been launched (running, or stopped/done/
+  // error afterwards) Start stays greyed out — the operator continues it by typing in an agent's
+  // chat (or Resume). Enabled only while the session is still "created".
+  const started = !!(state.session && state.session.status && state.session.status !== "created");
+  const sb = document.getElementById("startBtn");
+  if (sb) {
+    sb.disabled = started;
+    sb.title = started ? "Session already launched — type in an agent's chat (or Resume) to continue it" : "";
+  }
+  // LIMITED pentest (picker on + no free_target_choice): the target + instructions come from the provider
+  // script, so hide the manual entry fields. Free users keep them.
+  const limited = state.targetPicker && cap("launch_pentest") && !cap("free_target_choice");
+  show("instructionsRow", !limited);
+  const ti = document.getElementById("targetInput");
+  if (ti) {
+    ti.readOnly = limited;
+    ti.placeholder = limited
+      ? "Target is chosen from the approved list when you press Start"
+      : "In-scope target(s), e.g. 10.10.10.5, https://app.example.com";
+  }
 }
 async function doLogin() {
   const username = document.getElementById("loginUser").value.trim();
@@ -1431,6 +1851,7 @@ async function doLogin() {
   try {
     const r = await api("/api/auth/login", "POST", { username, password });
     document.getElementById("loginPass").value = "";
+    await refreshAuthMeta();   // pick up this user's capabilities + feature flags
     bootApp(r.user);
   } catch (e) { err.textContent = e.message || "login failed"; }
 }
@@ -1442,6 +1863,7 @@ async function doSetup() {
   if (password !== confirm) { err.textContent = "passwords do not match"; return; }
   try {
     const r = await api("/api/auth/setup", "POST", { username, password });
+    await refreshAuthMeta();
     bootApp(r.user);
   } catch (e) { err.textContent = e.message || "setup failed"; }
 }
@@ -1461,13 +1883,18 @@ async function loadUsers() {
   try { state.users = await api("/api/users"); } catch (e) { state.users = []; }
   renderUsers();
 }
+// Role <option> list = built-in admin + every custom role defined in the config.
+function roleOptions(selected) {
+  const names = ["admin", ...Object.keys((state.config && state.config.user_roles) || {})];
+  return names.map(n => `<option value="${esc(n)}" ${n === selected ? "selected" : ""}>${esc(n)}</option>`).join("");
+}
 function renderUsers() {
   const el = document.getElementById("usersConfig"); if (!el) return;
   const me = state.user || {};
   const rows = (state.users || []).map(u => `
     <tr>
       <td><b>${esc(u.username)}</b>${u.id === me.id ? ' <span class="muted">(you)</span>' : ""}</td>
-      <td><code>${esc(u.role)}</code></td>
+      <td><select class="small" onchange="changeUserRole('${u.id}', this.value)">${roleOptions(u.role)}</select></td>
       <td>${u.disabled ? '<span class="badge">disabled</span>' : '<span class="muted">active</span>'}</td>
       <td>
         <button class="small" onclick="resetUserPassword('${u.id}','${esc(u.username)}')">Reset password</button>
@@ -1477,6 +1904,126 @@ function renderUsers() {
     </tr>`).join("");
   el.innerHTML = `<div class="config-role"><table class="tools-table">
     <tr><th>username</th><th>role</th><th>status</th><th>actions</th></tr>${rows}</table></div>`;
+  // keep the "Add user" role dropdown in sync with the defined roles
+  const sel = document.getElementById("newUserRole");
+  if (sel) { const cur = sel.value; sel.innerHTML = roleOptions(cur && cur !== "" ? cur : "user"); }
+}
+async function changeUserRole(uid, role) {
+  try { await api(`/api/users/${uid}/role`, "POST", { role }); await loadUsers(); }
+  catch (e) { alert(e.message || "could not change role"); await loadUsers(); }
+}
+
+// ---------------------------------------------------------- access roles & grants (admin)
+// NOTE: these are USER ACCESS roles (capabilities), distinct from the AGENT roles managed on the
+// "Agents & skills" tab (renderRoles/addRole/removeRole above). Names are deliberately namespaced
+// (`…AccessRole…`) to avoid colliding with the agent-role functions/ids.
+const ACCESS_CAPS = ["read", "launch_pentest", "free_target_choice", "edit_session"];
+// Friendly DISPLAY names for the capability columns. These are labels only — the underlying keys
+// (ACCESS_CAPS, stored config, server logic) are unchanged. Edit the text here to rename a column.
+const CAP_LABELS = {
+  read: "Read",
+  launch_pentest: "Run pentest",
+  free_target_choice: "Free target choice",
+  edit_session: "Edit session name",
+};
+function capLabel(c) { return CAP_LABELS[c] || c; }
+// The capability columns to actually show. When the pentest rights are MERGED (SEPARATE_PENTEST off,
+// the default) launch_pentest is hidden — free_target_choice is the single pentest right.
+function accessCaps() {
+  return state.separatePentest ? ACCESS_CAPS : ACCESS_CAPS.filter(c => c !== "launch_pentest");
+}
+function renderAccess() { renderAccessRoles(); renderGrants(); }
+function renderAccessRoles() {
+  const el = document.getElementById("accessRolesConfig"); if (!el) return;
+  const roles = (state.config && state.config.user_roles) || {};
+  const caps = accessCaps();
+  let html = `<div class="config-role"><table class="tools-table"><tr><th>role</th>${caps.map(c => `<th>${esc(capLabel(c))}</th>`).join("")}<th></th></tr>`;
+  html += `<tr><td><b>admin</b> <span class="muted">(+Settings)</span></td>${caps.map(() => "<td>✓</td>").join("")}<td class="muted">built-in</td></tr>`;
+  for (const [name, rc] of Object.entries(roles)) {
+    html += `<tr><td><b style="color:var(--purple)">${esc(name)}</b></td>` +
+      caps.map(c => `<td><input type="checkbox" data-role-cap="${esc(name)}|${c}" ${rc[c] ? "checked" : ""} onchange="gatherAccessRoles()"></td>`).join("") +
+      `<td>${name === "user" ? '<span class="muted">default</span>' : `<button class="small danger" onclick="deleteAccessRole('${esc(name)}')">Delete</button>`}</td></tr>`;
+  }
+  el.innerHTML = html + "</table></div>";
+}
+function gatherAccessRoles() {
+  const roles = state.config.user_roles = state.config.user_roles || {};
+  document.querySelectorAll("[data-role-cap]").forEach(cb => {
+    const [name, capn] = cb.dataset.roleCap.split("|");
+    (roles[name] = roles[name] || {})[capn] = cb.checked;
+  });
+  // Merged mode: launch_pentest is hidden and tracks free_target_choice, so the single visible
+  // pentest checkbox controls both keys (no stale launch_pentest=true leaking a pentest right).
+  if (!state.separatePentest) {
+    for (const r of Object.values(roles)) r.launch_pentest = !!r.free_target_choice;
+  }
+}
+function addAccessRole() {
+  const name = document.getElementById("newAccessRoleName").value.trim();
+  const st = document.getElementById("addAccessRoleStatus");
+  state.config.user_roles = state.config.user_roles || {};
+  if (!name) { st.textContent = "enter a name"; return; }
+  if (name === "admin" || state.config.user_roles[name]) { st.textContent = "already exists"; return; }
+  gatherAccessRoles();
+  state.config.user_roles[name] = { read: false, launch_pentest: true, free_target_choice: true, edit_session: true };
+  document.getElementById("newAccessRoleName").value = "";
+  st.textContent = "✓ added — press Save to persist";
+  renderAccessRoles(); renderUsers();
+}
+function deleteAccessRole(name) {
+  if (name === "user") { alert("the default 'user' role cannot be deleted"); return; }
+  if (!confirm(`Delete role "${name}"? Reassign any users who still have it.`)) return;
+  gatherAccessRoles();
+  delete state.config.user_roles[name];
+  renderAccessRoles(); renderUsers();
+}
+function renderGrants() {
+  const el = document.getElementById("grantsConfig"); if (!el) return;
+  const grants = (state.config && state.config.session_grants) || {};
+  const uname = id => ((state.users || []).find(u => u.id === id) || {}).username || id;
+  let rows = "";
+  for (const [grantee, list] of Object.entries(grants)) {
+    (list || []).forEach((g, i) => {
+      const sess = (g.sessions || []).includes("*") ? "all sessions" : `${(g.sessions || []).length} session(s)`;
+      rows += `<tr><td><b>${esc(uname(grantee))}</b></td><td>${esc(uname(g.owner))}</td><td>${esc(sess)}</td>
+        <td><button class="small danger" onclick="deleteGrant('${esc(grantee)}',${i})">Remove</button></td></tr>`;
+    });
+  }
+  el.innerHTML = rows
+    ? `<div class="config-role"><table class="tools-table"><tr><th>reader</th><th>owner</th><th>sessions</th><th></th></tr>${rows}</table></div>`
+    : '<div class="config-role muted">No read grants yet.</div>';
+  const opts = (state.users || []).map(u => `<option value="${u.id}">${esc(u.username)}</option>`).join("");
+  ["grantGrantee", "grantOwner"].forEach(id => { const s = document.getElementById(id); if (s) s.innerHTML = opts; });
+  updateGrantSessions();
+}
+async function updateGrantSessions() {
+  const sel = document.getElementById("grantSessions"); if (!sel) return;
+  const owner = (document.getElementById("grantOwner") || {}).value;
+  let opts = '<option value="*">all of their sessions</option>';
+  (state.sessions || []).filter(s => s.owner === owner).forEach(s => { opts += `<option value="${s.id}">${esc(s.name)}</option>`; });
+  sel.innerHTML = opts;
+}
+function addGrant() {
+  const grantee = document.getElementById("grantGrantee").value;
+  const owner = document.getElementById("grantOwner").value;
+  const sv = document.getElementById("grantSessions").value;
+  const st = document.getElementById("addGrantStatus");
+  if (!grantee || !owner) { st.textContent = "pick both users"; return; }
+  if (grantee === owner) { st.textContent = "reader and owner must differ"; return; }
+  const grants = state.config.session_grants = state.config.session_grants || {};
+  const list = grants[grantee] = grants[grantee] || [];
+  let entry = list.find(g => g.owner === owner);
+  if (!entry) { entry = { owner, sessions: [] }; list.push(entry); }
+  if (sv === "*") entry.sessions = ["*"];
+  else if (!entry.sessions.includes("*") && !entry.sessions.includes(sv)) entry.sessions.push(sv);
+  st.textContent = "✓ added — press Save to persist";
+  renderGrants();
+}
+function deleteGrant(grantee, idx) {
+  const list = ((state.config.session_grants || {})[grantee]) || [];
+  list.splice(idx, 1);
+  if (!list.length) delete state.config.session_grants[grantee];
+  renderGrants();
 }
 async function addUser() {
   const username = document.getElementById("newUserName").value.trim();
@@ -1488,11 +2035,12 @@ async function addUser() {
     document.getElementById("newUserName").value = "";
     document.getElementById("newUserPass").value = "";
     st.textContent = "✓ added"; await loadUsers();
+    renderAccess();   // new user must appear in the access-grant dropdowns immediately
   } catch (e) { st.textContent = "✕ " + (e.message || "failed"); }
 }
 async function removeUser(uid, name) {
   if (!confirm(`Delete user "${name}"? Their sessions remain but become visible to admins only.`)) return;
-  try { await api(`/api/users/${uid}`, "DELETE"); await loadUsers(); }
+  try { await api(`/api/users/${uid}`, "DELETE"); await loadUsers(); renderAccess(); }
   catch (e) { alert(e.message || "delete failed"); }
 }
 async function resetUserPassword(uid, name) {

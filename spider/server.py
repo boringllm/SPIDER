@@ -83,13 +83,111 @@ def require_admin(request: Request) -> User:
     return user
 
 
+# --------------------------------------------------------------------------- #
+# Access control (custom roles + read grants). The built-in `admin` role has every
+# capability; other accounts get the capabilities of their assigned role in
+# cfg["user_roles"], plus read access to the sessions granted in cfg["session_grants"].
+# --------------------------------------------------------------------------- #
+def _role_caps(role: str, cfg: dict | None = None) -> dict:
+    """Capability map for a role name. Admin = all caps; otherwise the role's entry in
+    ``cfg["user_roles"]`` (falling back to the `user` profile, then nothing)."""
+    if role == "admin":
+        return {c: True for c in cfg_mod.PERMISSION_CAPS}
+    roles = ((cfg or cfg_mod.load_config()).get("user_roles") or {})
+    return roles.get(role) or roles.get("user") or {}
+
+
+def _can(user: User, cap: str, session=None, cfg: dict | None = None) -> bool:
+    """Whether `user` has capability `cap`. For `edit_session`, only the session OWNER (with the
+    cap) or an admin qualifies — granted read-only viewers never rename."""
+    if user.is_admin:
+        return True
+    caps = _role_caps(user.role, cfg)
+    if cap == "edit_session" and session is not None and getattr(session, "owner", None) != user.id:
+        return False
+    # Merged pentest right (SEPARATE_PENTEST off, the default): launch_pentest and free_target_choice
+    # are the same capability — holding EITHER grants both, so every pentester gets free target choice.
+    if cap in ("launch_pentest", "free_target_choice") and not _separate_pentest():
+        return bool(caps.get("launch_pentest") or caps.get("free_target_choice"))
+    return bool(caps.get(cap))
+
+
+def _can_view_session(user: User, summary_or_session, cfg: dict | None = None) -> bool:
+    """Whether `user` may VIEW a session: their own, any (admin), or one granted to a `read`-capable
+    account via cfg["session_grants"]. Accepts a Session object or a list summary dict."""
+    owner = summary_or_session.get("owner") if isinstance(summary_or_session, dict) else getattr(summary_or_session, "owner", None)
+    sid = summary_or_session.get("id") if isinstance(summary_or_session, dict) else getattr(summary_or_session, "id", None)
+    if user.is_admin or owner == user.id:
+        return True
+    cfg = cfg or cfg_mod.load_config()
+    if not _role_caps(user.role, cfg).get("read"):
+        return False
+    for g in (cfg.get("session_grants") or {}).get(user.id, []):
+        if g.get("owner") == owner:
+            allowed = g.get("sessions") or []
+            if "*" in allowed or sid in allowed:
+                return True
+    return False
+
+
+def _secure_cookies() -> bool:
+    """Whether to mark the login cookie ``Secure`` (only sent over HTTPS). Off by default so the
+    local-http dev workflow keeps working; set ``SPAIDER_SECURE_COOKIES=1`` for an HTTPS/prod
+    deployment so the session token is never transmitted in cleartext."""
+    return os.environ.get("SPAIDER_SECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _set_login_cookie(response: Response, token: str) -> None:
-    """Attach the login-token cookie: HttpOnly so JS can't read it, SameSite=Lax. Secure is
-    left off because SPAIDER is served over local http; enable it behind https."""
+    """Attach the login-token cookie: HttpOnly so JS can't read it, SameSite=Lax, and Secure when
+    ``SPAIDER_SECURE_COOKIES`` is set (enable it behind HTTPS in production)."""
     response.set_cookie(
-        auth_mod.COOKIE_NAME, token, httponly=True, samesite="lax",
+        auth_mod.COOKIE_NAME, token, httponly=True, samesite="lax", secure=_secure_cookies(),
         max_age=auth_mod.TOKEN_TTL, path="/",
     )
+
+
+# --------------------------------------------------------------------------- #
+# Login rate limiting — slow down online credential brute-forcing. In-memory, per
+# (client-IP + username): after _LOGIN_MAX failures within _LOGIN_WINDOW seconds the key is locked
+# out until the window rolls off. A successful login clears the counter. Bounded so it can't grow
+# unboundedly. Not a substitute for a WAF, but closes the "unlimited guesses" hole for a prod deploy.
+# --------------------------------------------------------------------------- #
+import time as _time  # noqa: E402
+
+_LOGIN_MAX = 8
+_LOGIN_WINDOW = 300.0
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+
+
+def _login_key(request: Request, username: str) -> str:
+    ip = request.client.host if request.client else "?"
+    return f"{ip}|{(username or '').strip().lower()}"
+
+
+def _login_recent(key: str) -> list[float]:
+    now = _time.time()
+    hits = [t for t in _LOGIN_ATTEMPTS.get(key, []) if now - t < _LOGIN_WINDOW]
+    if hits:
+        _LOGIN_ATTEMPTS[key] = hits
+    else:
+        _LOGIN_ATTEMPTS.pop(key, None)
+    return hits
+
+
+def _login_throttled(key: str) -> bool:
+    return len(_login_recent(key)) >= _LOGIN_MAX
+
+
+def _login_record_fail(key: str) -> None:
+    _LOGIN_ATTEMPTS.setdefault(key, []).append(_time.time())
+    # Opportunistic bound: if the table grows large, drop keys with no recent activity.
+    if len(_LOGIN_ATTEMPTS) > 4096:
+        for k in list(_LOGIN_ATTEMPTS):
+            _login_recent(k)
+
+
+def _login_reset(key: str) -> None:
+    _LOGIN_ATTEMPTS.pop(key, None)
 
 
 def _sanitize_config(cfg: dict) -> dict:
@@ -104,6 +202,14 @@ def _sanitize_config(cfg: dict) -> dict:
     for pk in ("client_proxy", "kali_proxy"):
         if isinstance(c.get(pk), dict) and c[pk].get("url"):
             c[pk]["url"] = ""     # the proxy URL embeds id:password credentials (admin-only)
+    # Top-level session MCP servers may carry credentials in their env / headers / auth blocks.
+    if isinstance(c.get("mcp_servers"), dict):
+        for s in c["mcp_servers"].values():
+            if isinstance(s, dict):
+                for secret_block in ("env", "headers", "auth"):
+                    if isinstance(s.get(secret_block), dict):
+                        s[secret_block] = {k: "" for k in s[secret_block]}
+    c["session_grants"] = {}      # who-can-read-whose-sessions is an admin-only mapping
     return c
 
 
@@ -120,9 +226,17 @@ class CreateSession(BaseModel):
     config: dict[str, Any] | None = None
 
 
+class RenameSession(BaseModel):
+    name: str
+
+
 class StartSession(BaseModel):
     target: str
     instructions: str = ""
+    # Optional session name dictated by the target-provider script (hidden picker flow). Applied
+    # server-side as part of starting the engagement, so a LIMITED operator (launch_pentest but no
+    # edit_session) still gets the script's name — the name isn't user-chosen, the script picks it.
+    name: str = ""
 
 
 class ResumeSession(BaseModel):
@@ -229,6 +343,10 @@ class DisableBody(BaseModel):
     disabled: bool
 
 
+class SetRole(BaseModel):
+    role: str
+
+
 # --------------------------------------------------------------------------- #
 # Authentication (login / first-run setup / logout) and user management
 # --------------------------------------------------------------------------- #
@@ -241,18 +359,78 @@ def _disclaimer_required() -> bool:
     return os.environ.get("SPAIDER_REQUIRE_DISCLAIMER", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _separate_pentest() -> bool:
+    """HIDDEN flag (``SEPARATE_PENTEST``, default 0/off): when OFF the ``launch_pentest`` and
+    ``free_target_choice`` capabilities are MERGED into a single pentest right — anyone who can run a
+    pentest gets free target choice, and ``launch_pentest`` is hidden in the access-roles UI. When ON
+    the two are distinct (limited vs. free), the original behaviour. Read per-request; undocumented."""
+    return os.environ.get("SEPARATE_PENTEST", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_targets() -> tuple[list[dict], str]:
+    """Run the operator's target-provider script (``target_providers/targets.py: list_targets()``)
+    and normalise the result to a list of {id,name,target,instructions,session_name}. Loaded fresh
+    each call so edits apply without a restart. Returns ``(targets, error)``; never raises."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent / "target_providers" / "targets.py"
+    if not path.is_file():
+        return [], f"target provider not found: {path}"
+    try:
+        spec = importlib.util.spec_from_file_location("spaider_targets", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        raw = mod.list_targets()
+    except Exception as e:  # noqa: BLE001 — operator script: surface the error, don't crash
+        return [], f"target provider failed: {type(e).__name__}: {e}"
+    out: list[dict] = []
+    for i, t in enumerate(raw or []):
+        if not isinstance(t, dict):
+            continue
+        target = str(t.get("target") or "").strip()
+        if not target:
+            continue
+        out.append({
+            "id": str(t.get("id") or t.get("name") or target or i),
+            "name": str(t.get("name") or target),
+            "target": target,
+            "instructions": str(t.get("instructions") or ""),
+            "session_name": str(t.get("session_name") or ""),
+        })
+    return out, ""
+
+
+@app.get("/api/targets")
+async def list_targets_ep(user: User = Depends(current_user)) -> dict:
+    """Targets to offer the operator at the start of every engagement (the target picker is always
+    on). `free` reflects the caller's `free_target_choice` capability (free = may also enter a target
+    manually / edit the session name)."""
+    if not _can(user, "launch_pentest"):
+        raise HTTPException(403, "you don't have permission to run pentests")
+    targets, error = _load_targets()
+    return {"enabled": True, "free": _can(user, "free_target_choice"), "targets": targets, "error": error}
+
+
 @app.get("/api/auth/status")
 async def auth_status(request: Request) -> dict:
     """Drives the UI's auth gate: whether the caller is logged in, and whether this is a
     fresh install with no users yet (-> show the 'create administrator' screen). Also carries the
-    hidden ``disclaimer`` flag (SPAIDER_REQUIRE_DISCLAIMER) so the SPA knows whether to gate
-    start-session / bypass-approvals behind the risk acknowledgement."""
+    hidden ``disclaimer`` flag, the caller's access **capabilities** (so the SPA can hide controls
+    it isn't allowed to use), and ``separate_pentest`` (whether the launch/free-target rights are
+    distinct or merged). The target picker is always on (``target_picker`` kept for the SPA)."""
     user = getattr(request.state, "user", None)
+    caps = {}
+    if user is not None:
+        caps = {c: _can(user, c) for c in cfg_mod.PERMISSION_CAPS}
     return {
         "authenticated": user is not None,
         "needs_setup": await auth.needs_setup(),
         "user": user.public() if user else None,
+        "is_admin": bool(user and user.is_admin),
+        "caps": caps,
         "disclaimer": _disclaimer_required(),
+        "target_picker": True,
+        "separate_pentest": _separate_pentest(),
     }
 
 
@@ -270,11 +448,16 @@ async def auth_setup(body: Credentials, response: Response) -> dict:
 
 
 @app.post("/api/auth/login")
-async def auth_login(body: Credentials, response: Response) -> dict:
+async def auth_login(body: Credentials, request: Request, response: Response) -> dict:
+    key = _login_key(request, body.username)
+    if _login_throttled(key):
+        raise HTTPException(429, "too many failed login attempts — wait a few minutes and try again")
     try:
         token, user = await auth.login(body.username, body.password)
     except AuthError as e:
+        _login_record_fail(key)
         raise HTTPException(401, str(e))
+    _login_reset(key)
     _set_login_cookie(response, token)
     return {"ok": True, "user": user.public()}
 
@@ -291,13 +474,35 @@ async def list_users(admin: User = Depends(require_admin)) -> list[dict]:
     return await auth.list_users()
 
 
+def _valid_role(role: str, cfg: dict | None = None) -> bool:
+    """A role name is valid if it is the built-in `admin` or a custom role defined in the config."""
+    role = (role or "").strip()
+    return role == "admin" or role in ((cfg or cfg_mod.load_config()).get("user_roles") or {})
+
+
 @app.post("/api/users")
 async def create_user_ep(body: CreateUser, admin: User = Depends(require_admin)) -> dict:
+    if not _valid_role(body.role):
+        raise HTTPException(400, f"unknown role '{body.role}'")
     try:
         user = await auth.create_user(body.username, body.password, body.role)
     except AuthError as e:
         raise HTTPException(400, str(e))
     return user.public()
+
+
+@app.post("/api/users/{uid}/role")
+async def set_role_ep(uid: str, body: SetRole, admin: User = Depends(require_admin)) -> dict:
+    """Assign an access role (admin or a custom role) to a user."""
+    if not _valid_role(body.role):
+        raise HTTPException(400, f"unknown role '{body.role}'")
+    if uid == admin.id and body.role != "admin":
+        raise HTTPException(400, "you cannot remove your own administrator role")
+    try:
+        await auth.set_role(uid, body.role)
+    except AuthError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
 
 
 @app.delete("/api/users/{uid}")
@@ -436,7 +641,9 @@ async def list_tools() -> list[dict]:
 # Model parameter presets
 # --------------------------------------------------------------------------- #
 @app.get("/api/presets")
-async def get_presets() -> dict:
+async def get_presets(admin: User = Depends(require_admin)) -> dict:
+    # SECURITY: presets snapshot a full model config and can embed api_key, so they are admin-only
+    # (the Settings UI that uses them is admin-only anyway).
     from . import presets
 
     return presets.load_presets()
@@ -472,8 +679,10 @@ async def get_skills() -> dict:
 # --------------------------------------------------------------------------- #
 # Modular agent definitions (system prompts + per-folder mcpo MCP config)
 # --------------------------------------------------------------------------- #
+# SECURITY: agent definitions carry per-agent MCP server configs whose `env` can hold third-party
+# secrets (API keys/tokens), so the agentdef GETs are admin-only (they back the admin Settings UI).
 @app.get("/api/agentdefs")
-async def list_agentdefs() -> list[dict]:
+async def list_agentdefs(admin: User = Depends(require_admin)) -> list[dict]:
     from . import agentdefs, registry
 
     cfg = cfg_mod.load_config()
@@ -482,7 +691,7 @@ async def list_agentdefs() -> list[dict]:
 
 
 @app.get("/api/agentdefs/{role}")
-async def get_agentdef(role: str) -> dict:
+async def get_agentdef(role: str, admin: User = Depends(require_admin)) -> dict:
     from . import agentdefs, registry
 
     cfg = cfg_mod.load_config()
@@ -512,7 +721,7 @@ async def put_agentdef(role: str, body: AgentDefUpdate, admin: User = Depends(re
 
 # ---- per-agent MCP server management ----
 @app.get("/api/agentdefs/{role}/mcp")
-async def list_agent_mcp(role: str) -> list[dict]:
+async def list_agent_mcp(role: str, admin: User = Depends(require_admin)) -> list[dict]:
     from . import agentdefs
 
     cfg = cfg_mod.load_config()
@@ -621,21 +830,35 @@ async def delete_role(role: str, admin: User = Depends(require_admin)) -> dict:
 # --------------------------------------------------------------------------- #
 @app.get("/api/sessions")
 async def list_sessions(user: User = Depends(current_user)) -> list[dict]:
-    """Sessions the caller may see: their own, or everything for an admin."""
-    return await manager.list_all(owner=None if user.is_admin else user.id)
+    """Sessions the caller may see: their own, everything for an admin, plus any other user's
+    sessions a `read`-capable account has been granted (cfg["session_grants"])."""
+    if user.is_admin:
+        return await manager.list_all(owner=None)
+    everything = await manager.list_all(owner=None)
+    cfg = cfg_mod.load_config()
+    return [s for s in everything if _can_view_session(user, s, cfg)]
+
+
+def _session_config_for(user: User, override: dict | None) -> dict:
+    """The config a new session runs under. SECURITY: only an admin may supply a per-session config
+    override — a caller-supplied config could otherwise re-enable host command execution
+    (poc_execution="host"), point the LLM at an attacker base_url/api_key, or repoint the Kali/proxy
+    endpoints, bypassing the admin-only global-config gate. Everyone else runs the saved config."""
+    return override if (override and user.is_admin) else cfg_mod.load_config()
 
 
 @app.post("/api/sessions")
 async def create_session(body: CreateSession, user: User = Depends(current_user)) -> dict:
-    cfg = body.config or cfg_mod.load_config()
+    cfg = _session_config_for(user, body.config)
     session = manager.create(body.name, cfg, owner=user.id)
     await session.persist()
     return session.to_dict()
 
 
 async def _require(sid: str, user: User):
-    """Load a session and enforce ownership. Returns 404 (not 403) for sessions the caller
-    doesn't own, so the API never reveals that another user's session id exists."""
+    """Load a session and enforce WRITE access (owner or admin). Returns 404 (not 403) for sessions
+    the caller can't act on, so the API never reveals that another user's session id exists. Used by
+    every mutating endpoint — granted read-only viewers cannot reach these."""
     session = await manager.load(sid)
     if not session:
         raise HTTPException(404, "session not found")
@@ -644,9 +867,18 @@ async def _require(sid: str, user: User):
     return session
 
 
+async def _require_view(sid: str, user: User):
+    """Load a session for READ access: the owner, an admin, or a `read`-capable account granted this
+    session. Used by the view/live endpoints so a reader can watch but never mutate."""
+    session = await manager.load(sid)
+    if not session or not _can_view_session(user, session):
+        raise HTTPException(404, "session not found")
+    return session
+
+
 @app.get("/api/sessions/{sid}")
 async def get_session(sid: str, user: User = Depends(current_user)) -> dict:
-    session = await _require(sid, user)
+    session = await _require_view(sid, user)
     return session.to_dict()
 
 
@@ -657,11 +889,35 @@ async def delete_session(sid: str, user: User = Depends(current_user)) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/sessions/{sid}/rename")
+async def rename_session(sid: str, body: RenameSession, user: User = Depends(current_user)) -> dict:
+    """Rename a session at any point in its lifecycle (the name is a pure label — everything is keyed
+    by the session id). Requires the `edit_session` capability (admins and the owner always have it)."""
+    session = await _require(sid, user)
+    if not _can(user, "edit_session", session):
+        raise HTTPException(403, "you don't have permission to rename this session")
+    try:
+        await session.rename(body.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return session.to_dict()
+
+
 @app.post("/api/sessions/{sid}/start")
 async def start_session(sid: str, body: StartSession, user: User = Depends(current_user)) -> dict:
     session = await _require(sid, user)
+    if not _can(user, "launch_pentest"):
+        raise HTTPException(403, "you don't have permission to run pentests")
     if session.status == "running":
         raise HTTPException(409, "session already running")
+    # Apply the provider-dictated name (if any) before starting. This is the script's choice, not the
+    # operator's, so it's allowed regardless of the edit_session capability (a limited operator can't
+    # rename freely, but the picker's name must still take effect).
+    if body.name and body.name.strip():
+        try:
+            await session.rename(body.name.strip())
+        except ValueError:
+            pass
     await session.start(body.target, body.instructions)
     return session.to_dict()
 
@@ -684,25 +940,25 @@ async def stop_session(sid: str, user: User = Depends(current_user)) -> dict:
 
 @app.get("/api/sessions/{sid}/agents")
 async def session_agents(sid: str, user: User = Depends(current_user)) -> list[dict]:
-    session = await _require(sid, user)
+    session = await _require_view(sid, user)
     return session.to_dict()["agents"]
 
 
 @app.get("/api/sessions/{sid}/plan")
 async def session_plan(sid: str, user: User = Depends(current_user)) -> dict:
-    session = await _require(sid, user)
+    session = await _require_view(sid, user)
     return session.plan
 
 
 @app.get("/api/sessions/{sid}/findings")
 async def session_findings(sid: str, user: User = Depends(current_user)) -> list[dict]:
-    session = await _require(sid, user)
+    session = await _require_view(sid, user)
     return list(session.findings.values())
 
 
 @app.get("/api/sessions/{sid}/cost")
 async def session_cost(sid: str, user: User = Depends(current_user)) -> dict:
-    session = await _require(sid, user)
+    session = await _require_view(sid, user)
     return session.cost
 
 
@@ -733,6 +989,18 @@ async def report_template(sid: str, file: UploadFile = File(...), user: User = D
     if error and not text:
         raise HTTPException(400, error)
     return {"name": name, "chars": len(text), "text": text, "error": error}
+
+
+@app.get("/api/sessions/{sid}/dashboard")
+async def session_dashboard(sid: str, user: User = Depends(current_user)) -> dict:
+    """Static (no-LLM) analytics for the session dashboard: a cost/token time series plus aggregate
+    breakdowns (per agent, per model, findings by severity, tool usage), computed from the persisted
+    event log so it works for a live OR a reopened session. The browser renders the charts and, on
+    demand, the downloadable HTML/CSV/JSON report."""
+    from . import dashboard as dash
+
+    session = await _require_view(sid, user)
+    return dash.compute(session)
 
 
 @app.get("/api/sessions/{sid}/report/file/{name}")
@@ -851,7 +1119,7 @@ async def kill_kali_process(sid: str, proc_id: str, body: KillProcessBody,
 
 @app.get("/api/sessions/{sid}/messages")
 async def session_messages(sid: str, user: User = Depends(current_user)) -> list[dict]:
-    await _require(sid, user)
+    await _require_view(sid, user)
     return await manager.db.list_messages(sid)
 
 
@@ -913,8 +1181,8 @@ async def ws_events(ws: WebSocket, sid: str) -> None:
         await ws.close(code=4401)  # unauthenticated
         return
     session = await manager.load(sid)
-    if not session or (not user.is_admin and session.owner != user.id):
-        await ws.close(code=4404)  # not found / not yours
+    if not session or not _can_view_session(user, session):
+        await ws.close(code=4404)  # not found / not yours / not granted
         return
     await ws.accept()
     q = bus.subscribe()

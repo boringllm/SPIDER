@@ -114,6 +114,13 @@ Everything below is configurable in **Settings** and steerable live during a run
   toggles command validation **for the current session only** (it overrides the global policy
   without changing it). Tick it to let commands run without sign-off; untick to re-enable. Turning
   it on also releases anything currently waiting for your approval.
+- **Access roles** — beyond the bootstrap **admin** (who has every right and is the only one who can
+  open Settings), the admin defines named **access roles** in *Settings → Access roles* and assigns
+  them to users. A role grants capabilities: **read** (view other users' sessions you've been
+  *granted*, read-only), **run pentest**, **edit session name**. Read grants (also in *Access roles*)
+  pick exactly whose sessions — and which of them — a reader may see.
+- **Rename a session** — click the **✎** next to the session title (needs the *edit session name*
+  capability). Safe at any time, before/during/after a run; it's just a label.
 - **Interjection** — type into the *Interject* box any time to ask a question or change direction;
   the orchestrator reads it on its next turn and adapts.
 - **Shared & master memory** — when an agent finishes, its key result and findings are written to a
@@ -240,12 +247,27 @@ reports, target documentation), press **Start**, approve the plan when prompted,
 agents work in the live feed and process tree. Attached documents are text-extracted and fed to
 the orchestrator (and saved in the session workspace under `uploads/` so any agent can read them).
 
+When you press **Start**, SPAIDER shows a **target picker** listing the approved targets returned by
+your provider script `target_providers/targets.py` (`list_targets()`). Customise that file to source
+targets from wherever you like (a CSV/JSON, a CMDB, an internal API…).
+
 ### 5. Generate the report
 Click **📄 Report**. Optionally upload a **template** (`.pdf` / `.docx` / `.md`) or paste one — the
 report-writer agent reproduces the template's structure **exactly** (same sections, order, headings,
 and tables), filled with the engagement's real content. The report is produced as **both a Markdown
 and a Word (`.docx`) file**, downloadable from the result dialog and saved under the session's
 `reports/` folder.
+
+### Analytics dashboard
+Switch a session to the **Dashboard** view for live, colored graphs of the engagement: cost over
+time, token usage over time, the token mix, cost per agent and per model, findings by severity, and
+the most-used tools. Everything is computed **statically** from the session's event log (no LLM), so
+it works for a running *or* a long-finished session. Press **⬇ Export report** to download, with no
+model call:
+- a self-contained **HTML report** (the graphs + all the tables, print-friendly) for a quick,
+  non-technical review, and
+- a **CSV** (tidy cost/token time series) + **JSON** bundle so a data-science team can load the raw
+  numbers straight into pandas / a notebook.
 
 ---
 

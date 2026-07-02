@@ -135,8 +135,6 @@ def _secure_cookies() -> bool:
     local-http dev workflow keeps working; set ``SPAIDER_SECURE_COOKIES=1`` for an HTTPS/prod
     deployment so the session token is never transmitted in cleartext."""
     return os.environ.get("SPAIDER_SECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _set_login_cookie(response: Response, token: str) -> None:
     """Attach the login-token cookie: HttpOnly so JS can't read it, SameSite=Lax, and Secure when
     ``SPAIDER_SECURE_COOKIES`` is set (enable it behind HTTPS in production)."""

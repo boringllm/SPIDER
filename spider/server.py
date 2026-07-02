@@ -135,6 +135,8 @@ def _secure_cookies() -> bool:
     local-http dev workflow keeps working; set ``SPAIDER_SECURE_COOKIES=1`` for an HTTPS/prod
     deployment so the session token is never transmitted in cleartext."""
     return os.environ.get("SPAIDER_SECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _set_login_cookie(response: Response, token: str) -> None:
     """Attach the login-token cookie: HttpOnly so JS can't read it, SameSite=Lax, and Secure when
     ``SPAIDER_SECURE_COOKIES`` is set (enable it behind HTTPS in production)."""
@@ -226,6 +228,11 @@ class CreateSession(BaseModel):
 
 class RenameSession(BaseModel):
     name: str
+
+
+class SetOwner(BaseModel):
+    # Target user id to reassign the session to. Blank = the requesting admin ("take ownership").
+    owner: str = ""
 
 
 class StartSession(BaseModel):
@@ -898,6 +905,21 @@ async def rename_session(sid: str, body: RenameSession, user: User = Depends(cur
         await session.rename(body.name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    return session.to_dict()
+
+
+@app.post("/api/sessions/{sid}/owner")
+async def take_session_ownership(sid: str, body: SetOwner, admin: User = Depends(require_admin)) -> dict:
+    """Reassign a session's owner (admin-only). With no body it transfers the session to the
+    requesting admin ("take ownership"); an explicit `owner` (a valid user id) reassigns it to that
+    user. The session then belongs to the new owner for isolation and the session list."""
+    session = await manager.load(sid)
+    if not session:
+        raise HTTPException(404, "session not found")
+    new_owner = (body.owner or admin.id).strip()
+    if new_owner != admin.id and not await manager.db.get_user(new_owner):
+        raise HTTPException(404, "no such user")
+    await session.set_owner(new_owner)
     return session.to_dict()
 
 

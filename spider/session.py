@@ -1672,6 +1672,17 @@ class Session:
         except Exception as e:  # noqa: BLE001
             bus.emit(E.ERROR, self.id, {"message": f"agent resume failed: {e}"}, agent_id=agent.id)
 
+    async def set_owner(self, owner: str) -> str:
+        """Reassign the session's owner (admin action). Safe at any time — the workspace/db/logs are
+        keyed by the session id, so this only changes who the session belongs to for access control
+        and the session list. Persists the change."""
+        owner = (owner or "").strip()
+        if not owner:
+            raise ValueError("owner must not be empty")
+        self.owner = owner
+        await self.persist()
+        return owner
+
     async def rename(self, name: str) -> str:
         """Change the session's display name. Safe at ANY time (before/during/after a run): the
         workspace folder, DB rows and event log are all keyed by the session ID, never the name, so

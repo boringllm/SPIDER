@@ -72,9 +72,10 @@ function renderSessions() {
   el.innerHTML = state.sessions.map(s => {
     const running = s.status === "running";
     // Label sessions that belong to OTHER users (an admin monitoring everyone, or a read-granted
-    // viewer) so it's clear whose engagement each one is. Only the owner (or an admin) may delete.
+    // viewer) so it's clear whose engagement each one is. The owner and any admin get full control
+    // (delete/rename/etc.); a read-granted viewer does not. The server enforces this either way.
     const others = s.owner && s.owner !== me.id;
-    const mayDelete = !others;  // server enforces; non-owners (readers) can't delete
+    const mayDelete = !others || state.isAdmin;
     const ownerTag = others ? `<span class="sess-owner" title="owner">👤 ${esc(s.owner_name || s.owner)}</span>` : "";
     return `
     <div class="session-item ${s.id === state.current ? "active" : ""} ${others ? "other-owner" : ""}" onclick="selectSession('${s.id}')">
@@ -1039,6 +1040,20 @@ async function renameSession() {
   } catch (e) { alert(e.message || "rename failed"); }
 }
 
+// Admin action: transfer this session to the current admin's account ("take ownership").
+async function takeOwnership() {
+  if (!state.current) return;
+  const summary = (state.sessions || []).find(x => x.id === state.current) || {};
+  const who = summary.owner_name || "another user";
+  if (!confirm(`Take ownership of this session from ${who}? It will move under your account.`)) return;
+  try {
+    const r = await api(`/api/sessions/${state.current}/owner`, "POST", {});   // blank owner = me
+    if (state.session) state.session.owner = r.owner;
+    await loadSessions();       // refresh the list (owner chip / delete button update)
+    applyCapsUI();              // hide the take-ownership button now that it's mine
+  } catch (e) { alert(e.message || "could not take ownership"); }
+}
+
 async function startSession() {
   let target = document.getElementById("targetInput").value.trim();
   let instructions = document.getElementById("instructionsInput").value.trim();
@@ -1823,6 +1838,10 @@ function applyCapsUI() {
   show("startBtn", cap("launch_pentest"));
   show("resumeBtn", cap("launch_pentest"));
   show("renameBtn", cap("edit_session"));
+  // Admins can take ownership of a session that belongs to someone else (moves it under their
+  // account). Only shown when this is another user's session.
+  const notMine = !!(state.session && state.user && state.session.owner && state.session.owner !== state.user.id);
+  show("takeOwnBtn", state.isAdmin && notMine);
   // Start only applies to a brand-NEW session. Once it has been launched (running, or stopped/done/
   // error afterwards) Start stays greyed out — the operator continues it by typing in an agent's
   // chat (or Resume). Enabled only while the session is still "created".

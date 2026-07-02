@@ -972,8 +972,6 @@ async def test_concise_nudge_on_max_tokens() -> None:
     check("agent retried after the concise nudge (provider called again)", fake.calls >= 2)
     check("concise counter reset once a turn fit the budget", child._concise_nudges == 0)
     await sess.shutdown()
-
-
 def test_security_fixes() -> None:
     """Regression tests for the user-abusable vulnerabilities that were fixed: per-session config
     injection, secret-bearing GETs left un-gated, login brute-force, and the Secure-cookie toggle."""

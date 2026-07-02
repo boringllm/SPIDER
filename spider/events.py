@@ -11,6 +11,7 @@ from typing import Any
 # Event type constants (documentation / avoid typos).
 class E:
     SESSION_STATUS = "session.status"
+    SESSION_RENAMED = "session.renamed"   # the operator renamed the session (live title update)
     PLAN_UPDATE = "plan.update"
     STEP_UPDATE = "plan.step"
     # Human-in-the-loop plan sign-off: the orchestrator proposed a plan and is waiting for

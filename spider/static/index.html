@@ -43,7 +43,7 @@
         <span id="userLabel" class="muted"></span>
         <button class="small" onclick="doLogout()">Log out</button>
       </div>
-      <div class="actions"><button class="primary" onclick="newSession()">+ New session</button></div>
+      <div class="actions" id="newSessionAction"><button class="primary" onclick="newSession()">+ New session</button></div>
       <div class="actions" id="settingsAction"><button onclick="openSettings()">⚙ Settings</button></div>
     </aside>
 
@@ -55,6 +55,7 @@
         <div class="sess-header">
           <div class="hrow hrow-top">
             <span class="sess-title" id="sessName"></span>
+            <button id="renameBtn" class="small" title="Rename this session" onclick="renameSession()" style="display:none">✎</button>
             <span id="sessStatus" class="badge">created</span>
             <span class="grow"></span>
             <span class="seg">
@@ -78,12 +79,12 @@
           <div class="hrow hrow-controls">
             <input id="targetInput" class="grow" placeholder="In-scope target(s), e.g. 10.10.10.5, https://app.example.com" />
             <span class="btn-group">
-              <button class="primary" onclick="startSession()">▶ Start</button>
-              <button onclick="resumeSession()">⟳ Resume</button>
+              <button id="startBtn" class="primary" onclick="startSession()">▶ Start</button>
+              <button id="resumeBtn" onclick="resumeSession()">⟳ Resume</button>
               <button class="danger" onclick="stopSession()">■ Stop</button>
             </span>
           </div>
-          <div class="hrow">
+          <div class="hrow" id="instructionsRow">
             <textarea id="instructionsInput" placeholder="Rules of engagement / scope: what is authorised, what is off-limits (no DoS, no data destruction), credentials provided, time window..."></textarea>
           </div>
           <div class="hrow hrow-attach">
@@ -144,12 +145,21 @@
           </div>
         </div>
 
-        <!-- DASHBOARD: cost only -->
+        <!-- DASHBOARD: cost + activity analytics -->
         <div id="dashboardView" class="dashboard hidden">
           <div class="card">
-            <h3>Cost dashboard — this session</h3>
+            <div class="dash-head">
+              <h3>Analytics dashboard — this session</h3>
+              <span class="dash-actions">
+                <button class="small" id="dashRefreshBtn" onclick="loadDashboard()" title="Recompute from the event log">↻ Refresh</button>
+                <button class="small primary" id="dashExportBtn" onclick="exportDashboardReport()"
+                  title="Generate a static report (no LLM): a readable HTML report with the graphs + a CSV/JSON data bundle">⬇ Export report</button>
+                <span id="dashExportStatus" class="muted" style="font-size:11px"></span>
+              </span>
+            </div>
             <div class="cost-grid" id="costGrid"></div>
           </div>
+          <div class="dash-charts" id="dashCharts"></div>
           <div class="card"><h3>Cost per agent</h3><table id="costByAgent"></table></div>
           <div class="card"><h3>Cost per model</h3><table id="costByModel"></table></div>
         </div>
@@ -169,6 +179,7 @@
           <button data-tab="tools" onclick="setSettingsTab('tools')">Tools</button>
           <button data-tab="pricing" onclick="setSettingsTab('pricing')">Pricing</button>
           <button data-tab="users" onclick="setSettingsTab('users')">Users</button>
+          <button data-tab="access" onclick="setSettingsTab('access')">Access roles</button>
         </nav>
         <span class="grow"></span>
         <button class="primary" onclick="saveConfig()">Save</button>
@@ -374,6 +385,39 @@
           </div>
         </div>
       </section>
+
+      <section class="settings-page hidden" data-page="access">
+        <h3>Access roles &amp; grants</h3>
+        <p class="muted" style="margin:0 0 8px">Define named access roles and the capabilities each
+          grants, then assign them to users (Users tab). The built-in <b>admin</b> role has every
+          capability and is the only role that can open Settings. Changes here are saved with the
+          <b>Save</b> button.</p>
+        <div id="accessRolesConfig"></div>
+        <div class="config-role">
+          <h4>Add role</h4>
+          <div class="toolbar">
+            <input id="newAccessRoleName" placeholder="role name, e.g. analyst" autocomplete="off" style="max-width:200px" />
+            <button class="primary small" onclick="addAccessRole()">+ Add role</button>
+            <span id="addAccessRoleStatus" class="muted" style="font-size:11px"></span>
+          </div>
+        </div>
+        <h3 style="margin-top:18px">Read grants</h3>
+        <p class="muted" style="margin:0 0 8px">Let a <b>read</b>-capable user view another user's
+          sessions (read-only). Grants are saved with <b>Save</b>.</p>
+        <div id="grantsConfig"></div>
+        <div class="config-role">
+          <h4>Add grant</h4>
+          <div class="config-grid">
+            <label>reader (grantee)<select id="grantGrantee"></select></label>
+            <label>owner (whose sessions)<select id="grantOwner" onchange="updateGrantSessions()"></select></label>
+            <label>sessions<select id="grantSessions"><option value="*">all of their sessions</option></select></label>
+          </div>
+          <div class="toolbar" style="margin-top:6px">
+            <button class="primary small" onclick="addGrant()">+ Add grant</button>
+            <span id="addGrantStatus" class="muted" style="font-size:11px"></span>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 
@@ -388,6 +432,29 @@
         <button onclick="resolveDisclaimer(false)">Cancel</button>
         <span class="grow"></span>
         <button class="primary danger-confirm" onclick="resolveDisclaimer(true)">I understand the risks &amp; accept full responsibility</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Target selection (always shown), after the disclaimer when starting an engagement. Limited
+       operators pick from the approved list only; free operators may also enter a target manually. -->
+  <div id="targetModal" class="hidden modal-wrap">
+    <div class="card" style="width:620px;max-height:88vh;overflow:auto;margin:0">
+      <h3>Select a pentest target</h3>
+      <div id="targetPickStatus" class="muted" style="font-size:11px;margin-bottom:8px"></div>
+      <div id="targetList" class="target-list"></div>
+      <div id="targetManual" class="target-manual hidden">
+        <label class="muted" style="font-size:11px">Target</label>
+        <input id="manualTarget" placeholder="host / IP / CIDR / URL" />
+        <label class="muted" style="font-size:11px;margin-top:8px;display:block">Instructions / scope</label>
+        <textarea id="manualInstr" style="min-height:60px" placeholder="Rules of engagement: what is authorised, what is off-limits..."></textarea>
+        <label class="muted" style="font-size:11px;margin-top:8px;display:block">Session name (optional)</label>
+        <input id="manualName" placeholder="leave blank to keep the current name" />
+      </div>
+      <div class="disclaimer-actions">
+        <button onclick="resolveTargetPicker(null)">Cancel</button>
+        <span class="grow"></span>
+        <button class="primary" id="targetStartBtn" onclick="confirmTargetPick()">Start engagement</button>
       </div>
     </div>
   </div>

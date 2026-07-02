@@ -426,6 +426,10 @@ class Session:
             pass
 
     async def create_agent(self, role: str, task: str, parent: Agent | None) -> Agent:
+        # Pick up the CURRENT global config before spawning, so a freshly spawned agent always runs
+        # on the latest settings (model/params/proxies/max_turns) rather than the snapshot frozen
+        # when the session was created.
+        self.reload_config()
         if not self.agent_defs:
             from . import agentdefs
             from .registry import role_specs
@@ -435,10 +439,9 @@ class Session:
         adef = self.agent_defs.get(role) or {"system": self.roles.get(role, {}).get("system_default", ""), "mcp": {}}
         count = sum(1 for a in self.agents.values() if a.role == role) + 1
         name = f"{role}#{count}" if role != "orchestrator" else "orchestrator"
-        model_config = deepcopy(self.cfg["models"].get(role) or self.cfg["models"]["orchestrator"])
-        # Route this agent's LLM calls through the operator's client proxy (if enabled). Read live
-        # from the session config so a proxy change applies on the next agent created/resumed.
-        model_config["_client_proxy"] = self.cfg.get("client_proxy")
+        # Route this agent's LLM calls through the operator's client proxy (if enabled). Built from
+        # the (just-reloaded) session config so a proxy/model change applies on the next agent.
+        model_config = self.build_model_config(role)
 
         is_helper = role in _HELPER_ROLES
         tools = self._tools_for_role(role)
@@ -1612,7 +1615,13 @@ class Session:
         ``max_turns``) would never apply; calling this when the session is resumed/continued lets it
         take effect. Agents read ``max_turns`` live from ``self.cfg`` (see ``Agent._max_turns``), so
         even already-created agents pick up the new budget; other params apply to agents spawned
-        after the refresh. Structural session fields are left untouched."""
+        after the refresh. Structural session fields are left untouched.
+
+        No-op when there is no saved config file on disk (a fresh install, or a test driving a session
+        from a hand-built in-memory config): in that case the in-memory ``self.cfg`` is authoritative
+        and must not be clobbered by the packaged defaults."""
+        if not cfg_mod._config_file().exists():
+            return
         try:
             latest = cfg_mod.load_config()
         except Exception:  # noqa: BLE001
@@ -1623,6 +1632,18 @@ class Session:
             self.cfg["pricing"] = latest["pricing"]
         if "max_context_tokens" in latest:
             self.cfg["max_context_tokens"] = latest["max_context_tokens"]
+        # Outbound proxies also affect how agents reach the LLM / Kali, so keep them current too.
+        for k in ("client_proxy", "kali_proxy"):
+            if k in latest:
+                self.cfg[k] = latest[k]
+
+    def build_model_config(self, role: str) -> dict[str, Any]:
+        """Build a fresh model_config for `role` from the session's CURRENT config (the per-role model
+        settings + the live client-proxy injection). Used both when spawning an agent and when a
+        finished/stopped agent is restarted, so each always runs on the latest configuration."""
+        mc = deepcopy(self.cfg["models"].get(role) or self.cfg["models"]["orchestrator"])
+        mc["_client_proxy"] = self.cfg.get("client_proxy")
+        return mc
 
     async def revive(self) -> None:
         """Bring a STOPPED session back to a working state so the operator can resume a
@@ -1650,6 +1671,18 @@ class Session:
             await agent.run_followup()
         except Exception as e:  # noqa: BLE001
             bus.emit(E.ERROR, self.id, {"message": f"agent resume failed: {e}"}, agent_id=agent.id)
+
+    async def rename(self, name: str) -> str:
+        """Change the session's display name. Safe at ANY time (before/during/after a run): the
+        workspace folder, DB rows and event log are all keyed by the session ID, never the name, so
+        renaming only updates the label. Persists and broadcasts a live title update."""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("name must not be empty")
+        self.name = name
+        await self.persist()
+        bus.emit(E.SESSION_RENAMED, self.id, {"name": name})
+        return name
 
     # ------------------------------------------------------------- persistence
     async def persist(self) -> None:

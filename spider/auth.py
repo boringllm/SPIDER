@@ -65,6 +65,12 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(dk.hex(), hash_hex)
 
 
+# A fixed dummy hash so ``authenticate`` spends the same scrypt time whether or not the username
+# exists — otherwise the response is measurably faster for unknown usernames, letting an attacker
+# enumerate valid accounts by timing. Computed once at import (one scrypt, a few ms).
+_DUMMY_HASH = hash_password("spaider-timing-equalizer-not-a-real-password")
+
+
 # --------------------------------------------------------------------------- #
 # User view object
 # --------------------------------------------------------------------------- #
@@ -110,10 +116,13 @@ class Auth:
     # ---- account management ----
     async def create_user(self, username: str, password: str, role: str = "user") -> User:
         username = (username or "").strip()
+        role = (role or "user").strip()
         if not username:
             raise AuthError("username is required")
-        if role not in ROLES:
-            raise AuthError(f"role must be one of {ROLES}")
+        if not role:
+            raise AuthError("role is required")
+        # `admin` is the built-in privileged role; any other value must be a custom role defined in
+        # the config (validated by the server before calling this — auth.py stays config-agnostic).
         if len(password or "") < 8:
             raise AuthError("password must be at least 8 characters")
         if await self.db.get_user_by_username(username):
@@ -148,6 +157,19 @@ class Auth:
             raise AuthError("cannot disable the last administrator")
         await self.db.update_user(uid, {"disabled": 1 if disabled else 0})
 
+    async def set_role(self, uid: str, role: str) -> None:
+        """Change a user's access role. Guards the last admin (can't demote the only one). Role
+        validity (custom roles) is checked by the caller against the config."""
+        role = (role or "").strip()
+        if not role:
+            raise AuthError("role is required")
+        row = await self.db.get_user(uid)
+        if not row:
+            raise AuthError("no such user")
+        if row["role"] == "admin" and role != "admin" and await self.db.count_admins() <= 1:
+            raise AuthError("cannot remove the last administrator")
+        await self.db.update_user(uid, {"role": role})
+
     async def delete_user(self, uid: str) -> None:
         row = await self.db.get_user(uid)
         if not row:
@@ -161,7 +183,10 @@ class Auth:
         """Verify credentials; raise AuthError on any failure (same message either way to
         avoid leaking which usernames exist)."""
         row = await self.db.get_user_by_username((username or "").strip())
-        if not row or not verify_password(password or "", row["pw_hash"]):
+        # Always run one scrypt verification (against a dummy hash when the user is unknown) so the
+        # timing doesn't reveal whether the username exists (account enumeration).
+        ok = verify_password(password or "", row["pw_hash"] if row else _DUMMY_HASH)
+        if not row or not ok:
             raise AuthError("invalid username or password")
         if row.get("disabled"):
             raise AuthError("account is disabled")

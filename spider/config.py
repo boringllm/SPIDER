@@ -96,6 +96,10 @@ DEFAULT_INTENSITY = "normal"
 #   "host"      — also allow agents to execute on the SPAIDER host (legacy behaviour).
 POC_EXECUTION_MODES = ["kali_only", "host"]
 DEFAULT_POC_EXECUTION = "kali_only"
+
+# Capabilities a custom user-access role can grant (see cfg["user_roles"]). The built-in `admin`
+# role implicitly has all of these PLUS exclusive access to Settings.
+PERMISSION_CAPS = ["read", "launch_pentest", "free_target_choice", "edit_session"]
 # Host command-execution tools confined to the Kali container in "kali_only" mode.
 HOST_EXEC_TOOLS = ["run_shell", "run_process", "terminal"]
 
@@ -253,6 +257,22 @@ def default_config() -> dict[str, Any]:
             "max_total_agents": 20,
             "max_spawn_depth": 3,
         },
+        # ---- Custom user-access roles (RBAC) ------------------------------------
+        # Named permission profiles a user account can be assigned (Settings → Access, admin-only).
+        # The built-in **admin** role is implicit and has EVERY capability plus exclusive access to
+        # Settings — it is not listed here and cannot be edited. Capabilities (see PERMISSION_CAPS):
+        #   read          — may view other users' sessions they've been granted (read-only)
+        #   launch_pentest   — may create and start engagements
+        #   free_target_choice  — when the hidden target-picker is on, may freely pick/enter a target,
+        #                   edit instructions, and rename the session (vs. a script-driven LIMITED run)
+        #   edit_session  — may rename their own sessions
+        # `user` is the default profile for a regular account (keeps the prior behaviour).
+        "user_roles": {
+            "user": {"read": False, "launch_pentest": True, "free_target_choice": True, "edit_session": True},
+        },
+        # Per-user read grants: which other users' sessions a `read`-capable account may view.
+        # { grantee_user_id: [ {"owner": owner_user_id, "sessions": ["*"] | [session_id, …]} ] }
+        "session_grants": {},
         "pricing": deepcopy(DEFAULT_PRICING),
     }
 
@@ -270,12 +290,19 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+def _config_file() -> Path:
+    """The active config file path, resolved from CONFIG_DIR at CALL time (not import time) so a
+    reassignment of ``config.CONFIG_DIR`` — e.g. for test isolation — actually redirects reads/writes."""
+    return CONFIG_DIR / "config.json"
+
+
 def load_config() -> dict[str, Any]:
     """Load configuration, merging any saved file over defaults so new keys appear."""
     cfg = default_config()
-    if CONFIG_FILE.exists():
+    cfile = _config_file()
+    if cfile.exists():
         try:
-            saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            saved = json.loads(cfile.read_text(encoding="utf-8"))
             cfg = _deep_merge(cfg, saved)
         except (json.JSONDecodeError, OSError):
             pass
@@ -292,6 +319,6 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(cfg: dict[str, Any]) -> None:
-    """Write the config tree to config/config.json (creating the folder if needed)."""
+    """Write the config tree to config.json under CONFIG_DIR (creating the folder if needed)."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    _config_file().write_text(json.dumps(cfg, indent=2), encoding="utf-8")

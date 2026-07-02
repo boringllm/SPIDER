@@ -176,6 +176,118 @@ def test_disclaimer_flag() -> None:
     os.environ.pop("SPAIDER_REQUIRE_DISCLAIMER", None)
 
 
+def test_rbac_and_targets() -> None:
+    """Custom access roles (capabilities), per-session read grants, the rename capability rule, the
+    hidden target-picker env flag, and the target-provider script."""
+    import os
+    from types import SimpleNamespace
+
+    from spider.server import (_can, _can_view_session, _load_targets, _role_caps,
+                               _separate_pentest, _valid_role)
+
+    cfg = {
+        "user_roles": {
+            "user": {"read": False, "launch_pentest": True, "free_target_choice": True, "edit_session": True},
+            "viewer": {"read": True, "launch_pentest": False, "free_target_choice": False, "edit_session": False},
+            "limited": {"read": False, "launch_pentest": True, "free_target_choice": False, "edit_session": False},
+        },
+        "session_grants": {
+            "u_viewer": [{"owner": "u_alice", "sessions": ["*"]},
+                         {"owner": "u_bob", "sessions": ["s_one"]}],
+        },
+    }
+    admin = SimpleNamespace(id="u_admin", role="admin", is_admin=True)
+    viewer = SimpleNamespace(id="u_viewer", role="viewer", is_admin=False)
+    limited = SimpleNamespace(id="u_lim", role="limited", is_admin=False)
+
+    # The launch/free-target distinction only exists when SEPARATE_PENTEST is on; force it on for the
+    # distinction-based checks below (the merged-default behaviour is tested separately at the end).
+    os.environ["SEPARATE_PENTEST"] = "1"
+
+    # capabilities
+    check("admin has every cap", all(_role_caps("admin").get(c) for c in ("read", "launch_pentest", "free_target_choice", "edit_session")))
+    check("viewer can read, not run", _can(viewer, "read", cfg=cfg) and not _can(viewer, "launch_pentest", cfg=cfg))
+    check("limited can run but not free", _can(limited, "launch_pentest", cfg=cfg) and not _can(limited, "free_target_choice", cfg=cfg))
+    check("admin can do anything", _can(admin, "free_target_choice") and _can(admin, "edit_session"))
+
+    # read grants (alice = all, bob = only s_one)
+    alice_s = {"owner": "u_alice", "id": "s_x"}
+    bob_one = {"owner": "u_bob", "id": "s_one"}
+    bob_two = {"owner": "u_bob", "id": "s_two"}
+    own = {"owner": "u_viewer", "id": "s_self"}
+    check("viewer sees granted owner's sessions (wildcard)", _can_view_session(viewer, alice_s, cfg))
+    check("viewer sees specifically-granted session", _can_view_session(viewer, bob_one, cfg))
+    check("viewer cannot see non-granted session of bob", not _can_view_session(viewer, bob_two, cfg))
+    check("viewer sees own session", _can_view_session(viewer, own, cfg))
+    check("admin sees any session", _can_view_session(admin, bob_two, cfg))
+    check("limited (no read) sees only own", not _can_view_session(limited, alice_s, cfg))
+
+    # edit_session only for the OWNER (with the cap), never a granted viewer
+    sess_alice = SimpleNamespace(owner="u_alice", id="s_x")
+    check("viewer cannot rename a granted session", not _can(viewer, "edit_session", sess_alice, cfg))
+    sess_own = SimpleNamespace(owner="u_lim", id="s_self")
+    check("limited cannot rename even own (no cap)", not _can(limited, "edit_session", sess_own, cfg))
+
+    # role validity
+    check("admin role is valid", _valid_role("admin", cfg))
+    check("custom role is valid", _valid_role("viewer", cfg))
+    check("unknown role is invalid", not _valid_role("ghost", cfg))
+
+    # SEPARATE_PENTEST (hidden, default OFF): with it OFF the launch_pentest and free_target_choice
+    # rights are MERGED — a "limited" role (launch only) gains free target choice. With it ON, the
+    # original limited-vs-free distinction holds.
+    os.environ.pop("SEPARATE_PENTEST", None)
+    check("pentest rights merged by default", _separate_pentest() is False)
+    check("merged: limited role gains free target choice", _can(limited, "free_target_choice", cfg=cfg))
+    check("merged: limited can still launch", _can(limited, "launch_pentest", cfg=cfg))
+    check("merged: viewer (no pentest) still cannot run", not _can(viewer, "launch_pentest", cfg=cfg))
+    os.environ["SEPARATE_PENTEST"] = "1"
+    check("SEPARATE_PENTEST on restores the distinction", _separate_pentest() is True)
+    check("separate: limited has NO free target choice", not _can(limited, "free_target_choice", cfg=cfg))
+    check("separate: limited can still launch", _can(limited, "launch_pentest", cfg=cfg))
+    os.environ.pop("SEPARATE_PENTEST", None)
+
+    # the example target-provider script returns usable, normalised targets
+    targets, error = _load_targets()
+    check("target provider returns targets", not error and len(targets) >= 1)
+    check("targets are normalised", all(t.get("target") and "name" in t and "session_name" in t for t in targets))
+
+    # start accepts a provider-dictated session name (applied server-side so a LIMITED operator —
+    # launch_pentest but no edit_session — still gets the script's name when the picker drives it)
+    from spider.server import StartSession
+    check("start carries a provider name", StartSession(target="t", name="From script").name == "From script")
+    check("start name defaults empty", StartSession(target="t").name == "")
+
+
+async def test_session_rename() -> None:
+    """A session can be renamed at any time without breaking its workspace/db (both keyed by id)."""
+    import tempfile
+
+    from spider import config
+    from spider.db import Database
+    from spider.session import Session
+
+    tmp = Path(tempfile.mkdtemp(prefix="spider_rename_"))
+    cfg = _mock_cfg()
+    cfg["workspace_root"] = str(tmp / "workspaces")
+    cfg["agents_dir"] = str(tmp / "agents")
+    config.CONFIG_DIR = tmp / "config"
+    db = Database(str(tmp / "r.db"))
+    sess = Session("Original name", "t", cfg, db)
+    await sess.setup()
+    sid = sess.id
+    await sess.rename("Renamed mid-session")
+    check("session name updated", sess.name == "Renamed mid-session")
+    rows = await db.list_sessions(owner=None)
+    check("rename persisted to db", any(r["id"] == sid and r["name"] == "Renamed mid-session" for r in rows))
+    try:
+        await sess.rename("   ")
+        check("empty rename rejected", False)
+    except ValueError:
+        check("empty rename rejected", True)
+    await sess.shutdown()
+
+
 def test_approval_policy() -> None:
     from spider import config
     from spider.db import Database
@@ -323,6 +435,15 @@ async def test_turn_budget_handoff() -> None:
           all(s.status == "done" and s.awaiting_validation is False for s in summarizers))
     check("exhausted sub-agent closes done (not stuck awaiting validation)", child.status == "done")
     check("exhausted sub-agent is not awaiting validation", child.awaiting_validation is False)
+
+    # The handoff summary must reach MASTER MEMORY (record_agent_memory runs when the exhausted agent
+    # closes 'done'), so agents spawned afterwards inherit what the summarizer distilled.
+    master_path = sess.workspace / "memory" / "master.md"
+    master_txt = master_path.read_text(encoding="utf-8") if master_path.exists() else ""
+    check("handoff summary written to master memory file",
+          "REACHED MAX TURN BUDGET" in master_txt and child.name in master_txt)
+    check("master memory updated in-memory", any(child.name in e for e in sess.master_memory))
+    check("later agents inherit the handoff via the master digest", child.name in sess._master_memory_block())
 
     # Re-engaging an EXHAUSTED agent whose budget was NOT raised must NOT spawn a SECOND summarizer
     # for the same exhaustion (the bug where the summarizer kicked in twice for one exhausted agent).
@@ -648,6 +769,15 @@ async def test_auth_and_isolation() -> None:
     except AuthError:
         check("bad login rejected", True)
 
+    # V6 — username-enumeration hardening: an unknown username is rejected (same generic error) and
+    # still runs the dummy scrypt path so it can't be told apart by timing, and never authenticates.
+    from spider import auth as _authmod
+    try:
+        await auth.login("ghost-user", "whatever"); check("unknown user rejected", False)
+    except AuthError:
+        check("unknown user rejected", True)
+    check("dummy timing hash never authenticates", not verify_password("whatever", _authmod._DUMMY_HASH))
+
     # last-admin guard
     try:
         await auth.delete_user(admin.id); check("last admin protected", False)
@@ -714,6 +844,144 @@ def test_kali_server() -> None:
     check("kali limiter is an async context manager", hasattr(cm, "__aenter__") and hasattr(cm, "__aexit__"))
 
 
+def test_dashboard_compute() -> None:
+    """The static (no-LLM) dashboard analytics are computed correctly from the event log: a
+    cost/token time series plus aggregate breakdowns (per agent/model, findings, tools)."""
+    import json as _json
+    import tempfile
+    from types import SimpleNamespace
+
+    from spider import dashboard
+
+    tmp = Path(tempfile.mkdtemp(prefix="spider_dash_"))
+    (tmp / "logs").mkdir(parents=True, exist_ok=True)
+    c1 = {"total_usd": 0.01, "input_tokens": 100, "output_tokens": 50, "cache_read": 0, "cache_write": 0,
+          "by_agent": {"a1": {"name": "recon#1", "role": "recon", "model": "m", "usd": 0.01, "input": 100, "output": 50}},
+          "by_model": {"m": {"usd": 0.01, "input": 100, "output": 50}}}
+    c2 = {"total_usd": 0.03, "input_tokens": 300, "output_tokens": 120, "cache_read": 10, "cache_write": 5,
+          "by_agent": {"a1": {"name": "recon#1", "role": "recon", "model": "m", "usd": 0.03, "input": 300, "output": 120}},
+          "by_model": {"m": {"usd": 0.03, "input": 300, "output": 120}}}
+    events = [
+        {"type": "agent.created", "ts": 99.0, "payload": {"role": "orchestrator"}},
+        {"type": "agent.created", "ts": 100.0, "payload": {"role": "recon"}},
+        {"type": "cost.update", "ts": 100.0, "payload": {"cost": c1}},
+        {"type": "tool.call", "ts": 101.0, "payload": {"tool": "kali__nmap"}},
+        {"type": "tool.call", "ts": 102.0, "payload": {"tool": "kali__nmap"}},
+        {"type": "finding.stored", "ts": 105.0, "payload": {"finding": {"id": "f1", "severity": "high", "status": "confirmed", "title": "XSS"}}},
+        {"type": "finding.stored", "ts": 106.0, "payload": {"finding": {"id": "f2", "severity": "low", "status": "open", "title": "info leak"}}},
+        {"type": "cost.update", "ts": 110.0, "payload": {"cost": c2}},
+    ]
+    with (tmp / "logs" / "events.jsonl").open("w", encoding="utf-8") as f:
+        for e in events:
+            f.write(_json.dumps(e) + "\n")
+    session = SimpleNamespace(id="s1", name="demo", target="10.0.0.1", status="done",
+                              workspace=tmp, cost={}, findings={}, agents={})
+    d = dashboard.compute(session)
+
+    check("time series has one point per cost.update", len(d["series"]) == 2)
+    check("series elapsed measured from first cost point", d["series"][1]["elapsed_s"] == 10.0)
+    check("totals reflect the latest cumulative snapshot", d["totals"]["total_usd"] == 0.03 and d["totals"]["input_tokens"] == 300)
+    check("cache buckets carried through", d["totals"]["cache_read"] == 10 and d["totals"]["cache_write"] == 5)
+    check("agents counted from agent.created", d["totals"]["agents"] == 2)
+    check("tool calls counted", d["totals"]["tool_calls"] == 2 and d["tools"][0]["tool"] == "kali__nmap" and d["tools"][0]["count"] == 2)
+    check("llm calls = number of cost updates", d["totals"]["llm_calls"] == 2)
+    check("duration spans the whole event stream", d["totals"]["duration_s"] == 11.0)
+    check("per-agent breakdown present", len(d["by_agent"]) == 1 and d["by_agent"][0]["usd"] == 0.03)
+    check("per-model breakdown present", len(d["by_model"]) == 1 and d["by_model"][0]["model"] == "m")
+    check("findings bucketed by severity", d["findings_by_severity"]["high"] == 1 and d["findings_by_severity"]["low"] == 1)
+    check("findings total counted", d["totals"]["findings"] == 2)
+    check("findings bucketed by status", d["findings_by_status"].get("confirmed") == 1 and d["findings_by_status"].get("open") == 1)
+
+    # No event log at all → safe empty result (no crash).
+    empty = SimpleNamespace(id="s2", name="e", target="", status="created",
+                            workspace=tmp / "nope", cost={}, findings={}, agents={})
+    de = dashboard.compute(empty)
+    check("missing event log yields empty analytics", de["series"] == [] and de["totals"]["total_usd"] == 0)
+
+
+def test_security_fixes() -> None:
+    """Regression tests for the user-abusable vulnerabilities that were fixed: per-session config
+    injection, secret-bearing GETs left un-gated, login brute-force, and the Secure-cookie toggle."""
+    import os
+    from types import SimpleNamespace
+
+    from spider import server
+
+    # V1 — per-session config injection: only admins may supply a config override; a regular user's
+    # override is ignored (they always run the saved global config, so they can't flip poc_execution
+    # to "host" or inject a malicious LLM endpoint).
+    evil = {"poc_execution": "host", "models": {"orchestrator": {"base_url": "http://attacker"}}}
+    admin = SimpleNamespace(id="u_a", role="admin", is_admin=True)
+    normal = SimpleNamespace(id="u_n", role="user", is_admin=False)
+    check("non-admin config override is ignored", server._session_config_for(normal, evil) is not evil)
+    check("admin config override is honored", server._session_config_for(admin, evil) is evil)
+    check("empty override falls back to global config", server._session_config_for(admin, None) is not evil)
+
+    # V2/V3 — the secret-bearing GET endpoints must require admin (presets embed api_key; agentdef
+    # MCP configs embed env secrets). Verify the dependency wiring declaratively.
+    def _route_deps(path: str, method: str = "GET") -> set:
+        for r in server.app.routes:
+            if getattr(r, "path", None) == path and method in getattr(r, "methods", set()):
+                names, stack = set(), [r.dependant]
+                while stack:
+                    d = stack.pop()
+                    if getattr(d, "call", None) is not None:
+                        names.add(getattr(d.call, "__name__", ""))
+                    stack.extend(d.dependencies)
+                return names
+        return set()
+
+    for path in ("/api/presets", "/api/agentdefs", "/api/agentdefs/{role}", "/api/agentdefs/{role}/mcp"):
+        check(f"{path} is admin-gated", "require_admin" in _route_deps(path))
+    # sanity: a normal session-view endpoint is NOT admin-gated (regular users must still use it)
+    check("/api/sessions/{sid} is not admin-gated", "require_admin" not in _route_deps("/api/sessions/{sid}"))
+
+    # V4 — login brute-force throttle.
+    server._LOGIN_ATTEMPTS.clear()
+    key = "1.2.3.4|victim"
+    check("fresh key is not throttled", not server._login_throttled(key))
+    for _ in range(server._LOGIN_MAX):
+        server._login_record_fail(key)
+    check("key is throttled after MAX failures", server._login_throttled(key))
+    server._login_reset(key)
+    check("successful login resets the throttle", not server._login_throttled(key))
+    server._LOGIN_ATTEMPTS.clear()
+
+    # V5 — Secure-cookie toggle for HTTPS/prod deployments.
+    os.environ.pop("SPAIDER_SECURE_COOKIES", None)
+    check("secure cookies off by default", server._secure_cookies() is False)
+    os.environ["SPAIDER_SECURE_COOKIES"] = "1"
+    check("secure cookies on when set", server._secure_cookies() is True)
+    os.environ.pop("SPAIDER_SECURE_COOKIES", None)
+
+    # V7 — the non-admin config sanitizer strips ALL secret material, including top-level MCP server
+    # env / headers / auth blocks (previously only model api_key / kali token / proxy urls).
+    raw = {
+        "models": {"orchestrator": {"api_key": "sk-secret"}},
+        "kali": {"token": "kali-secret"},
+        "client_proxy": {"url": "http://u:p@host:8080"},
+        "session_grants": {"x": [{"owner": "y", "sessions": ["*"]}]},
+        "mcp_servers": {"s1": {"env": {"TOKEN": "mcp-secret"}, "headers": {"Authorization": "Bearer z"}}},
+    }
+    san = server._sanitize_config(raw)
+    check("model api_key stripped", san["models"]["orchestrator"]["api_key"] == "")
+    check("kali token stripped", san["kali"]["token"] == "")
+    check("proxy url stripped", san["client_proxy"]["url"] == "")
+    check("session_grants stripped", san["session_grants"] == {})
+    check("mcp env secret stripped", san["mcp_servers"]["s1"]["env"]["TOKEN"] == "")
+    check("mcp header secret stripped", san["mcp_servers"]["s1"]["headers"]["Authorization"] == "")
+    check("sanitize does not mutate the original", raw["mcp_servers"]["s1"]["env"]["TOKEN"] == "mcp-secret")
+
+    # V8 — the dynamic user-UPDATE only accepts whitelisted columns (so a stray/attacker key can't be
+    # interpolated into the SET clause). Values are always bound params.
+    from spider.db import Database
+    db = Database(":memory:")
+    try:
+        db._update_user("nobody", {"role='admin'--": "x"}); check("rejects non-whitelisted update column", False)
+    except ValueError:
+        check("rejects non-whitelisted update column", True)
+
+
 def main() -> int:
     print("== SPAIDER smoke test ==")
     print("- config & roles");      test_config_and_roles()
@@ -721,6 +989,8 @@ def main() -> int:
     print("- approval policy");     test_approval_policy()
     print("- .env loader");         test_env_loader()
     print("- disclaimer flag");     test_disclaimer_flag()
+    print("- rbac & targets");      test_rbac_and_targets()
+    print("- session rename");      asyncio.run(test_session_rename())
     print("- llm test + proxies");  test_connection_test_and_proxies()
     print("- poc execution policy"); test_poc_execution_policy()
     print("- reference documents"); test_reference_documents()
@@ -735,6 +1005,8 @@ def main() -> int:
     print("- orchestrator not summarized"); asyncio.run(test_orchestrator_not_summarized_on_exhaustion())
     print("- max_turns live + budget preserved"); asyncio.run(test_max_turns_live_and_budget_preserved())
     print("- re-engage after stop"); asyncio.run(test_reengage_after_stop())
+    print("- dashboard analytics");  test_dashboard_compute()
+    print("- security fixes");       test_security_fixes()
     print(f"\n== {_passed}/{_passed + _failed} checks passed ==")
     return 1 if _failed else 0
 

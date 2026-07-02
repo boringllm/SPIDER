@@ -54,8 +54,10 @@ class Agent:
         # "waiting_validation" until its parent accepts it (then _validated=True, status done).
         # The root (orchestrator) needs no validation. Helper agents (summarizer / tool_selector)
         # are transient internal workers — nobody ever calls `validate_agent` on them, so they must
-        # NOT require validation or they'd sit in "waiting_validation" forever.
-        self._validated = parent is None or role in ("summarizer", "tool_selector")
+        # NOT require validation or they'd sit in "waiting_validation" forever. The reporting agent
+        # is the final deliverable writer (launched by generate_report, not reviewed by a parent), so
+        # it auto-completes to `done` too instead of parking in "waiting_validation".
+        self._validated = parent is None or role in ("summarizer", "tool_selector", "reporting")
         self._finish_nudges = 0           # times we've nudged this agent to call finish
         self._stop = asyncio.Event()
         self.inbox: "asyncio.Queue[str]" = asyncio.Queue()
@@ -183,6 +185,13 @@ class Agent:
         self._stop.clear()
         self._finished = False
         self._finish_nudges = 0
+        # A restarted (finished/stopped) agent should run on the CURRENT config, not the snapshot it
+        # was created with: refresh the session's config from disk, then rebuild this agent's own
+        # model_config (model/params/proxy) from it and drop the cached provider so it's recreated
+        # with the new settings on the next LLM call.
+        self.session.reload_config()
+        self.model_config = self.session.build_model_config(self.role)
+        self._provider = None
         # If the budget was RAISED in Settings since this agent exhausted, there are rounds to run
         # again — allow a future genuine exhaustion to summarize. If the budget is still spent,
         # keep `_exhausted` set so the loop's else-branch won't summarize this same exhaustion a

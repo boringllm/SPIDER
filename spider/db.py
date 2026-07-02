@@ -341,7 +341,15 @@ class Database:
         """Number of enabled admin accounts — guards against deleting/demoting the last admin."""
         return await self._run(self._count_admins)
 
+    # Columns an update may touch. The SET clause is built from the caller's dict KEYS (the VALUES are
+    # always bound params), so restricting the keys to this allow-list keeps that interpolation safe
+    # even if a future caller were to pass an unexpected/attacker-influenced field name.
+    _USER_UPDATE_COLS = {"username", "pw_hash", "role", "disabled"}
+
     def _update_user(self, uid: str, fields: dict) -> None:
+        bad = set(fields) - self._USER_UPDATE_COLS
+        if bad:
+            raise ValueError(f"cannot update user column(s): {', '.join(sorted(bad))}")
         sets = ", ".join(f"{k}=:{k}" for k in fields)
         self._conn.execute(f"UPDATE users SET {sets} WHERE id=:id", {**fields, "id": uid})
         self._conn.commit()
